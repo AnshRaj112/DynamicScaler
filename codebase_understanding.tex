@@ -1,0 +1,257 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\geometry{margin=0.8in}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{mdframed}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.97,0.97,0.95}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2
+}
+
+\lstset{style=mystyle}
+
+\newmdenv[backgroundcolor=backcolour,linewidth=0.5pt,innerleftmargin=10pt,innerrightmargin=10pt,linecolor=codegray]{simplebox}
+
+\title{Hyper-Detailed Technical Reference: DynamicScaler}
+\author{CVPR 2025: Seamless and Scalable Video Generation for Panoramic Scenes}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Introduction}
+DynamicScaler is a comprehensive framework for generating 360-degree panoramic videos. This document serves as a hyper-detailed architectural, mathematical, and codebase reference. Every single file, structural module, and critical mathematical function is documented. The mathematical equations, matrices, and probabilistic sequences are fully preserved and paired with simple plain-English explanations.
+
+\begin{simplebox}
+\textbf{Overview: What is DynamicScaler?} \\
+At a high level, DynamicScaler is an AI pipeline designed to generate seamless video onto a spherical surface. It ensures that no matter where the camera points in 360 degrees, the video is continuous, free of distortions, and physically accurate.
+\end{simplebox}
+
+\section{System Orchestration: The Base Folder}
+
+The main folder contains the entry-point scripts that coordinate the overall generation process.
+
+\subsection{\texttt{gen\_pano\_360.py}}
+This is the primary execution script. It takes the user's configuration parameters and orchestrates the entire 360 video generation. 
+
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+Think of this file as the main control room. When a user requests a video, this file reads the instructions, figures out the necessary steps, and delegates the heavy lifting to the three main processing stages (low-res sphere, 1x planar, and 2x upscaling).
+\end{simplebox}
+
+\textbf{Key Components in \texttt{gen\_pano\_360.py}:}
+\begin{itemize}
+    \item \texttt{main()}: The core loop that executes Stage 1 (Low-Res Sphere Projection), Stage 2 (Planar Overlap Tuning), and Stage 3 (2x Upscaling). 
+    \item \texttt{VArgs}: A data class that stores the arguments passed from the command line, determining exactly how the generation should run (e.g., seed, dimensions).
+\end{itemize}
+
+
+\section{Utility Modules: \texttt{utils/} Folder}
+The utilities folder holds fundamental operations required for spatial and temporal manipulation of the video data.
+
+\subsection{\texttt{panorama\_tensor\_utils.py}}
+This module contains the rigorous mathematics required to map flat (perspective) images onto a spherical (equirectangular) surface.
+
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+If you try to wrap a flat map around a globe, the top and bottom stretch heavily. This file contains the rigorous mathematical matrices needed to handle that stretching perfectly, so the AI can paint flat images that seamlessly wrap around the entire 360 environment.
+\end{simplebox}
+
+\textbf{Rigorous Mathematical Transformations:}
+\begin{itemize}
+    \item \textbf{\texttt{\_get\_uv()}: Mapping Perspective Space to Equirectangular.} \\
+    Derived from the physical field-of-view (FOV), the focal length $f$ defines the camera geometry:
+    \[ f = \frac{W_{\text{proj}}}{2 \tan(\text{FOV} / 2)} \]
+    A camera meshgrid $(X_{\text{image}}, Y_{\text{image}})$ is generated. Direction vectors are initialized and normalized on the unit sphere:
+    \[ \vec{P} = \begin{bmatrix} x \\ y \\ z \end{bmatrix} = \text{normalize}\left( \begin{bmatrix} X_{\text{image}} \\ Y_{\text{image}} \\ f \end{bmatrix} \right) \]
+    Euler rotations matrices for pitch ($\phi$) and yaw ($\theta$) define the pose:
+    \[ \mathbf{R}_{\phi} = \begin{bmatrix} 1 & 0 & 0 \\ 0 & \cos\phi & -\sin\phi \\ 0 & \sin\phi & \cos\phi \end{bmatrix}, \quad \mathbf{R}_{\theta} = \begin{bmatrix} \cos\theta & 0 & \sin\theta \\ 0 & 1 & 0 \\ -\sin\theta & 0 & \cos\theta \end{bmatrix} \]
+    The rotation is applied: $\vec{P}_{\text{rot}} = \mathbf{R}_{\theta} \mathbf{R}_{\phi} \vec{P} = \begin{bmatrix} x_{\text{rot}} \\ y_{\text{rot}} \\ z_{\text{rot}} \end{bmatrix}$. \\
+    The 3D unit vectors are then mapped to spherical angles (longitude and latitude):
+    \[ \lambda = \text{atan2}(x_{\text{rot}}, z_{\text{rot}}), \quad \varphi = \arcsin(y_{\text{rot}}) \]
+    Finally, mapped to the continuous equirectangular $(u, v)$ pixel coordinate grid bounded by resolution $W \times H$:
+    \[ u = \left( \frac{\lambda + 2\pi}{2\pi} \right) \pmod{1} \cdot (W-1), \quad v = \left( \frac{\varphi + \pi/2}{\pi} \right) \cdot (H-1) \]
+    \item \textbf{\texttt{get\_view\_tensor\_interpolate()}:} Extracts a standard, flat perspective view from the spherical latent proxy using bi-linear interpolation.
+    \item \textbf{\texttt{set\_view\_tensor\_bilinear()}:} Re-projects a flat perspective image back onto the spherical tensor. It uses bilinear splatting based on fractional weighting to prevent aliasing. For an arbitrary projected float coordinate $x$:
+    \[ w_0(x) = 1 - (x - \lfloor x \rfloor), \quad w_1(x) = x - \lfloor x \rfloor \]
+    Memory-safe accumulation is achieved structurally over flattened spatial buffers via \texttt{index\_add\_}.
+\end{itemize}
+
+\subsection{\texttt{ring\_panorama\_tensor\_utils.py \& shift\_window\_utils.py}}
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+Handling massive $2048 \times 1024$ continuous latents is impossible for GPUs directly. These files process latents by defining sliding mathematical $W_{window} \times H_{window}$ overlapping blocks, enforcing infinite cyclic behavior horizontally mapping the right boundary perfectly onto the left via Modulo.
+\end{simplebox}
+
+\textbf{Modulo Bounds Execution:}
+When slicing a window starting at column index $w_{\text{start}}$ of width $w_{\text{win}}$ from a latent field of total width $W_{\text{total}}$, the indices are calculated explicitly as:
+\[ I_{\text{col}} = (w_{\text{start}} + i) \pmod{W_{\text{total}}}, \quad \forall i \in \{0, \dots, w_{\text{win}}-1\} \]
+This algebraic mapping inherently models the closed circular topology without extending the memory footprint.
+
+\subsection{\texttt{loop\_merge\_utils.py}, \texttt{diffusion\_utils.py}, \texttt{precast\_latent\_utils.py}, \texttt{multi\_prompt\_utils.py}}
+\begin{itemize}
+    \item \textbf{\texttt{loop\_merge\_utils.py}}: Cleanly blends adjacent temporal frames explicitly handling linear transparency ramps between the tensor edges to eradicate localized gradient artifacts.
+    \item \textbf{\texttt{diffusion\_utils.py}}: Standard dictionary scheduling matrices for $t$ tracking.
+    \item \textbf{\texttt{precast\_latent\_utils.py}}: Handles caching specific external static image paths into VAE arrays dynamically limiting runtime conversions.
+    \item \textbf{\texttt{multi\_prompt\_utils.py}}: Dictionary mappings associating specific bounding $\phi$ yaw domains to textual prompt encodings.
+\end{itemize}
+
+
+\section{Core LVDM Framework: \texttt{lvdm/} Folder}
+LVDM stands for Latent Video Diffusion Models. This is the heart of the AI's generation capability.
+
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+The \texttt{lvdm} folder houses the actual neural networks (the "brain"). It contains the code that understands how to trace patterns out of pure noise, recognizing objects, geometry, and motion across time.
+\end{simplebox}
+
+\subsection{Main Models (\texttt{models/} Folder)}
+
+\subsubsection{\texttt{ddpm3d.py}}
+The massive central hub defining the core probabilistic Diffusion process.
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+Diffusion works by destroying an image with noise, and training an AI to reverse the process. This file contains the exact statistical equations dictating how much noise to add at step $T$, and how to calculate the denoised structure at step $T-1$.
+\end{simplebox}
+
+\textbf{Rigorous Formulas:}
+Let $\mathbf{x}_0$ be the original un-noised latent representation.
+\begin{itemize}
+    \item \textbf{\texttt{q\_sample()}: Forward Process.} \\
+    Injects noise following a Markov chain defined by variance schedule $\beta_t \in (0, 1)$ and $\alpha_t = 1 - \beta_t$, $\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$.
+    The transition is modeled exactly as:
+    \[ q(\mathbf{x}_t | \mathbf{x}_0) = \mathcal{N}(\mathbf{x}_t; \sqrt{\bar{\alpha}_t} \mathbf{x}_0, (1 - \bar{\alpha}_t)\mathbf{I}) \]
+    Sampling evaluates cleanly without stepwise recursion:
+    \[ \mathbf{x}_t = \sqrt{\bar{\alpha}_t}\mathbf{x}_0 + \sqrt{1 - \bar{\alpha}_t}\mathbf{\epsilon} \]
+    
+    \item \textbf{\texttt{p\_sample\_loop()}: Reverse Denoising Process.} \\
+    The neural network $\mathbf{\epsilon}_\theta(\mathbf{x}_t, t)$ predicts the applied noise matrix. The predicted denoised sample is mathematically obtained inside \texttt{predict\_start\_from\_noise()}:
+    \[ \hat{\mathbf{x}}_0 = \frac{1}{\sqrt{\bar{\alpha}_t}} \left( \mathbf{x}_t - \sqrt{1 - \bar{\alpha}_t} \mathbf{\epsilon}_\theta(\mathbf{x}_t, t) \right) \]
+    The tensor is then stepped backwards towards $t-1$ utilizing the posterior mean tracking $\tilde{\mu}_t(\mathbf{x}_t, \mathbf{x}_0)$ via \texttt{p\_mean\_variance()}:
+    \[ \tilde{\mu}_t = \frac{\sqrt{\bar{\alpha}_{t-1}}\beta_t}{1 - \bar{\alpha}_t} \hat{\mathbf{x}}_0 + \frac{\sqrt{\alpha}_t(1 - \bar{\alpha}_{t-1})}{1 - \bar{\alpha}_t} \mathbf{x}_t \]
+\end{itemize}
+
+\subsubsection{\texttt{autoencoder.py}}
+Maps high resolution pixel space to compressed lower-dimensional latent spaces.
+
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+Working on 4K video is computationally expensive. The Autoencoder "zips" the raw video into a tiny, compressed mathematical format tracking deep spatial correlations without saving sub-pixel noise.
+\end{simplebox}
+
+\textbf{The Latent Embedding Math:}
+The \texttt{encode()} branch produces two parameterized normal distributions vectors: Mean ($\mu$) and Log-Variance ($\log \sigma^2$).
+The latent sample $\mathbf{z}$ is drawn utilizing the continuous stochastic reparameterization trick:
+\[ \mathbf{z} = \mu + \sigma \odot \mathbf{\epsilon}, \quad \text{where } \mathbf{\epsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I}) \]
+Training enforces structural limits pulling the representations towards standard normals via Kullback-Leibler (KL) Divergence:
+\[ D_{\text{KL}}\big(\mathcal{N}(\mu, \sigma^2) \parallel \mathcal{N}(0, 1)\big) = -\frac{1}{2} \sum \left( 1 + \log(\sigma^2) - \mu^2 - \sigma^2 \right) \]
+
+\subsection{Neural Modules (\texttt{modules/} Folder)}
+
+\subsubsection{\texttt{networks/openaimodel3d.py}}
+The 3D U-Net backbone architecture.
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+A U-Net processes data in a U-shape: it shrinks the data down, extracts deep features at the bottom, and expands it back up. In this 3D model, the layers consider not just the $X$ and $Y$ spatial axes, but also the $Time$ axis.
+\end{simplebox}
+
+\textbf{GroupNorm and ResBlock Mathematics:}
+Within the stacked sequences, representations are normalized explicitly via \texttt{GroupNorm}. The channel dimension $C$ is partitioned into $G$ groups, tracking mean $\mu_g$ and standard deviation $\sigma_g$ strictly per-group bounding scale explosion:
+\[ \hat{\mathbf{H}}_c = \frac{\mathbf{H}_c - \mu_g}{\sqrt{\sigma_g^2 + \epsilon}} \gamma_c + \beta_c \]
+Temporal tracking leverages 3D convolutions modeled as $C_{\text{out}} \times C_{\text{in}} \times k_t \times k_h \times k_w$ block tensor dimensions, alternating independent 2D spatial sweeps followed by 1D temporal $3 \times 1 \times 1$ layers extracting deep rigid trajectories.
+
+\subsubsection{\texttt{attention.py}}
+Self and Cross Attention logic directing deep feature alignment.
+
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+Attention layers compute relationship scorings—identifying similarities between spatial visual features and targeted text words—acting like exact semantic spotlights over specific image regions matching the user prompt.
+\end{simplebox}
+
+\textbf{Rigorous Scaled Dot-Product Matrices:}
+An input sequence is embedded into matrices for matching: Query ($\mathbf{Q}$), Key ($\mathbf{K}$), and Value ($\mathbf{V}$) of dimensionality $d_k$:
+\[ \text{Attention}(\mathbf{Q}, \mathbf{K}, \mathbf{V}) = \text{softmax} \left( \frac{\mathbf{Q} \mathbf{K}^T}{\sqrt{d_k}} \right) \mathbf{V} \]
+
+\begin{itemize}
+    \item \textbf{\texttt{RelativePosition}:} Rather than absolute positional tracking, a learnable array maps pairwise pixel token distances $\mathbf{E}_r$:
+    \[ a_{ij} = \frac{(\mathbf{x}_i \mathbf{W}_Q)(\mathbf{x}_j \mathbf{W}_K + \mathbf{e}_{i-j})^T}{\sqrt{d_k}} \]
+    This directly injects distance-aware biases inherently into the Softmax pre-normalization logits, allowing models to grasp relative geometric shifts seamlessly.
+\end{itemize}
+
+
+\section{Pipeline Implementation (\texttt{pipeline/} Folder)}
+Pipelines connect the raw mathematical models to the generation loops, taking algorithmic configurations and outputting tensors arrays.
+
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+Pipelines are the automated factory sequences. While the models encapsulate the heavy math, the pipelines specify exactly what order the blocks and loops should be executed within to draw the final scene.
+\end{simplebox}
+
+\subsection{\texttt{t2v\_sphere\_panorama\_pipeline.py}}
+The main pipeline for Text-to-Video panoramas orchestrating $t \in \{T, \dots, 0\}$.
+
+\textbf{Key Methods:}
+\begin{itemize}
+    \item \texttt{basic\_sample\_shift\_shpere\_panorama()}: Directly maps projective matrix boundaries $\mathbf{P}_i$ extracting $\mathbf{x}_{\text{view}}$. Denoising creates $\hat{\mathbf{x}}_{\text{view}}$, which is back-projected mapping the global structural bounds onto the exact unraveled target proxy grid.
+    \item \texttt{basic\_sample\_shift\_multi\_windows()}: Translates to a continuous flattened 2D space tensor and iteratively tracks shifting fractional bounds overlapping overlapping sub-tensors $H_{win} \times W_{win}$ smoothing global integration borders perfectly utilizing Modulo $I_{col}$ algebraic closures.
+\end{itemize}
+
+\subsection{\texttt{i2v\_sphere\_panorama\_pipeline.py}}
+Image-to-Video logic.
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+Rather than generating exclusively from pure text, this pipeline encodes a source photograph to ground the neural generations tightly against exact user-provided visual compositions mapping the RGB matrix continuously into the VAE constraints dynamically animating structural objects inherently inside the image array bounds.
+\end{simplebox}
+
+
+\section{Accessory Tooling (\texttt{scripts/} Folder)}
+
+\begin{simplebox}
+\textbf{Simple Explanation} \\
+These are handler tools bridging human interactions directly with the AI, enabling visual tests and heavy-duty headless cluster jobs.
+\end{simplebox}
+
+\begin{itemize}
+    \item \textbf{\texttt{gradio/}}: Spawns interactive browser GUIs parsing simple web sliding parameters back into Python float matrix definitions.
+    \item \textbf{\texttt{run\_text2video.sh}}: A bash executable defining strictly configured memory limits, node constraints, and dependency overrides for running standard parallel inference jobs unattended across vast cluster spaces without manual typing overheads.
+    \item \textbf{\texttt{evaluation/funcs.py}}: Exposes deep validation mathematical comparators, extracting metrics evaluating structural coherence between identical frame chunks explicitly tracking $\Delta \sigma_p$ boundaries assessing video jitter penalties dynamically.
+\end{itemize}
+
+\section{Conclusion}
+DynamicScaler heavily merges structural software engineering directly against complex multivariate probabilistic topologies and dense linear algebra arrays. Integrating highly compressed Autoencoder bounds, temporal U-net derivatives, Modulo constraint mapping, and exact reverse Markov chain $\tilde{\mu}_t$ inference derivations achieves perfectly localized interpolation inside continuously unbounded spherical topologies natively.
+
+\end{document}
