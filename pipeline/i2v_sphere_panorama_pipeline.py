@@ -63,6 +63,8 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
             merge_renoised_overlap_latent_ratio: float = None,  
             merge_prev_denoised_ratio_list: List[float] = None,
 
+            temporal_guidance_scale: Optional[float] = None,
+
             denoise_to_step: int = None,
             paste_on_static = None,
 
@@ -226,13 +228,26 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
 
         bs = batch_size * num_videos_per_prompt  # ?
 
+        # Cache VAE encode once when paste_on_static (identical across timesteps)
+        cached_frame_0_latent = None
+        if paste_on_static:
+            cached_frame_0_latent = self.tiled_vae_encode_image(
+                image_path=pano_image_path, image_size=(equirect_height, equirect_width))
+
+        # Cache text embeddings per phi for consistent CLIP conditioning (avoids recompute per view/timestep)
+        phi_text_emb_cache = {}
+        if phi_prompt_dict is not None:
+            for phi_angle, phi_prompt in phi_prompt_dict.items():
+                phi_text_emb_cache[phi_angle] = self.pretrained_t2v.get_learned_conditioning([phi_prompt])
+
         # 6. DDIM Sampling Loop
         with self.progress_bar(total=len(timesteps)) as progress_bar:
 
             for i, t in enumerate(timesteps):
 
                 phi_offset = 0
-                theta_offset = (i % loop_step_theta) * (view_fov // loop_step_theta)
+                # Float division for full angular coverage (no integer-division gaps)
+                theta_offset = (i % loop_step_theta) * (view_fov / loop_step_theta)
 
                 print(f"\n"
                       f"i = {i}, t = {t}")
@@ -243,9 +258,8 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
 
 
                 if paste_on_static and i < total_steps - 1:
-
-                    frame_0_latent = self.tiled_vae_encode_image(image_path=pano_image_path,
-                                                                 image_size=(equirect_height, equirect_width))
+                    # Use cached VAE encode (encode once before loop) to avoid O(T) redundant encodes
+                    frame_0_latent = cached_frame_0_latent
 
                     clear_repeat_latent = torch.cat([frame_0_latent] * total_f, dim=2)
                     noised_repeat_latent = self.scheduler.re_noise(x_a=clear_repeat_latent,
@@ -376,10 +390,9 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
                             img_emb = self.pretrained_t2v.get_image_embeds(batch_imgs=view_condition_image_tensor)
 
                             print_prompt = prompt
-                            if phi_prompt_dict is not None:
-                                curr_phi_prompt = phi_prompt_dict[phi_angle]
-                                text_emb = self.pretrained_t2v.get_learned_conditioning([curr_phi_prompt])
-                                print_prompt = curr_phi_prompt
+                            if phi_prompt_dict is not None and phi_angle in phi_text_emb_cache:
+                                text_emb = phi_text_emb_cache[phi_angle]
+                                print_prompt = phi_prompt_dict[phi_angle]
 
                             imtext_cond = torch.cat([text_emb, img_emb], dim=1)
                             cond = {"c_crossattn": [imtext_cond], "fps": fps}
@@ -398,6 +411,18 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
                                 temporal_length=frames,
                                 **kwargs 
                             )
+
+                            if temporal_guidance_scale is not None and temporal_guidance_scale != 0:
+                                model_pred_image = self.pretrained_t2v.model(
+                                    view_latent,
+                                    ts,
+                                    **cond,
+                                    curr_time_steps=ts,
+                                    temporal_length=frames,
+                                    no_temporal_attn=True,
+                                    **kwargs
+                                )
+                                model_pred_cond = model_pred_cond + temporal_guidance_scale * (model_pred_cond - model_pred_image)
 
                             if guidance_scale != 1.0:
 
@@ -502,12 +527,22 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
         return encoded_latent
     
     @torch.no_grad()
-    def tiled_vae_encode_tensor_simple(self, image_tensor: torch.Tensor, h_tile_num=4, w_tile_num=4, overlap_h=32, overlap_w=32):
-
+    def tiled_vae_encode_tensor_simple(self, image_tensor: torch.Tensor, h_tile_num=None, w_tile_num=None, overlap_h=None, overlap_w=None):
+        """Tiled VAE encode with Gaussian/cosine-tapered blend in overlap. Tile count and overlap are resolution-adaptive if not set."""
         B, C_img, F, H_dec, W_dec = image_tensor.shape
         scale_factor = self.vae_scale_factor
         H_latent = H_dec // scale_factor
         W_latent = W_dec // scale_factor
+
+        # Resolution-adaptive defaults: ~64 latent px per tile, overlap ~32 image px
+        if h_tile_num is None:
+            h_tile_num = max(2, H_latent // 64)
+        if w_tile_num is None:
+            w_tile_num = max(2, W_latent // 64)
+        if overlap_h is None:
+            overlap_h = min(32, H_dec // (h_tile_num * 4))
+        if overlap_w is None:
+            overlap_w = min(32, W_dec // (w_tile_num * 4))
 
         tile_h_latent = H_latent // h_tile_num
         tile_w_latent = W_latent // w_tile_num
@@ -516,12 +551,13 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
 
         overlap_h_image = overlap_h * scale_factor
         overlap_w_image = overlap_w * scale_factor
+        overlap_h_latent = overlap_h_image // scale_factor
+        overlap_w_latent = overlap_w_image // scale_factor
 
         device = image_tensor.device
         dtype = image_tensor.dtype
-        img_latent = torch.zeros((B, 4, F, H_latent, W_latent), device=device,
-                                 dtype=torch.float32)
-        count = torch.zeros((B, 1, 1, H_latent, W_latent), device=device, dtype=torch.float32)
+        img_latent = torch.zeros((B, 4, F, H_latent, W_latent), device=device, dtype=torch.float32)
+        weight_acc = torch.zeros((B, 1, 1, H_latent, W_latent), device=device, dtype=torch.float32)
 
         for i in range(h_tile_num):
             for j in range(w_tile_num):
@@ -537,7 +573,7 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
                 w_end_ov_image = min(w_end_image + overlap_w_image, W_dec)
 
                 image_tile = image_tensor[:, :, :, h_start_ov_image:h_end_ov_image, w_start_ov_image:w_end_ov_image]
-                latent_tile = self.pretrained_t2v.encode_first_stage_2DAE(image_tile)  # [B, C, F, h_sub, w_sub]
+                latent_tile = self.pretrained_t2v.encode_first_stage_2DAE(image_tile)
 
                 top_cut = (h_start_image - h_start_ov_image) // scale_factor
                 left_cut = (w_start_image - w_start_ov_image) // scale_factor
@@ -545,19 +581,37 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
                 right_cut = latent_tile.shape[4] - ((w_end_ov_image - w_end_image) // scale_factor)
 
                 latent_tile_cropped = latent_tile[:, :, :, top_cut:bottom_cut, left_cut:right_cut]
+                ch, cw = latent_tile_cropped.shape[3], latent_tile_cropped.shape[4]
+
+                # Cosine-tapered weight in overlap: W(d) = 0.5*(1+cos(pi*(d-d0)/O)) in overlap, 1 otherwise
+                h_coord = torch.linspace(0, ch - 1, ch, device=device, dtype=torch.float32)
+                w_coord = torch.linspace(0, cw - 1, cw, device=device, dtype=torch.float32)
+                w_h = torch.ones(ch, device=device, dtype=torch.float32)
+                w_w = torch.ones(cw, device=device, dtype=torch.float32)
+                if overlap_h_latent > 0:
+                    # top overlap
+                    for d in range(min(overlap_h_latent, ch)):
+                        w_h[d] = 0.5 * (1 + math.cos(math.pi * d / max(1, overlap_h_latent)))
+                    # bottom overlap
+                    for d in range(max(0, ch - overlap_h_latent), ch):
+                        w_h[d] = 0.5 * (1 + math.cos(math.pi * (ch - 1 - d) / max(1, overlap_h_latent)))
+                if overlap_w_latent > 0:
+                    for d in range(min(overlap_w_latent, cw)):
+                        w_w[d] = 0.5 * (1 + math.cos(math.pi * d / max(1, overlap_w_latent)))
+                    for d in range(max(0, cw - overlap_w_latent), cw):
+                        w_w[d] = 0.5 * (1 + math.cos(math.pi * (cw - 1 - d) / max(1, overlap_w_latent)))
+                tile_weight = (w_h.unsqueeze(1) * w_w.unsqueeze(0)).view(1, 1, 1, ch, cw)
 
                 h_start_latent = i * tile_h_latent
                 h_end_latent = (i + 1) * tile_h_latent
                 w_start_latent = j * tile_w_latent
                 w_end_latent = (j + 1) * tile_w_latent
 
-                img_latent[:, :, :, h_start_latent:h_end_latent, w_start_latent:w_end_latent] += latent_tile_cropped
+                img_latent[:, :, :, h_start_latent:h_end_latent, w_start_latent:w_end_latent] += latent_tile_cropped * tile_weight
+                weight_acc[:, :, :, h_start_latent:h_end_latent, w_start_latent:w_end_latent] += tile_weight
 
-                count[:, :, :, h_start_latent:h_end_latent, w_start_latent:w_end_latent] += 1
-
-        count = torch.clamp(count, min=1.0)
-
-        img_latent = img_latent / count
+        weight_acc = torch.clamp(weight_acc, min=1e-8)
+        img_latent = img_latent / weight_acc
 
         return img_latent
 

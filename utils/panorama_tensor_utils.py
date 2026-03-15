@@ -35,7 +35,8 @@ class PanoramaTensor:
 
         u, v = self._get_uv(fov=fov, theta=theta, phi=phi, width=width, height=height)
 
-        grid_u = (u / (self.W - 1)) * 2 - 1  # [height, width]
+        # u in [0, W); map to grid_sample coords [-1, 1]
+        grid_u = (u / self.W) * 2 - 1 if self.W > 1 else torch.zeros_like(u)
         grid_v = (v / (self.H - 1)) * 2 - 1  # [height, width]
         grid = torch.stack((grid_u, grid_v), dim=-1)  # [height, width, 2]
         grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, height, width, 2]
@@ -95,61 +96,58 @@ class PanoramaTensor:
         pano = flat_pano.view(B, self.C, self.H, self.W)
         self.equirect_tensor = pano.view(*leading_dims, self.C, self.H, self.W) if B > 1 else pano.squeeze(0)
 
-    def set_view_tensor_bilinear(self, view_tensor, fov, theta, phi):
+    def set_view_tensor_bilinear(self, view_tensor, fov, theta, phi, blend_alpha=1.0):
+        """Bilinear write-back with optional blend with existing panorama: P_new = alpha * (sum w_k V_k)/sum w_k + (1-alpha)*P_old."""
         if view_tensor.dim() == 3:
             view_tensor = view_tensor.unsqueeze(0)  # [1, C, H, W]
 
         leading_dims = view_tensor.shape[:-3]  # [*, C, H, W]
         B = torch.prod(torch.tensor(leading_dims)).item() if len(leading_dims) > 0 else 1
-        view = view_tensor.view(B, self.C, view_tensor.shape[-2], view_tensor.shape[-1]).clone()  # [B, C, height, width]
+        view = view_tensor.view(B, self.C, view_tensor.shape[-2], view_tensor.shape[-1])  # [B, C, height, width]
 
         width, height = view.shape[-1], view.shape[-2]
 
         u, v = self._get_uv(fov=fov, theta=theta, phi=phi, width=width, height=height)
 
-        u0 = torch.floor(u).long()
-        v0 = torch.floor(v).long()
+        u0 = torch.floor(u).long().clamp(0, self.W - 1)
+        v0 = torch.floor(v).long().clamp(0, self.H - 1)
         u1 = (u0 + 1) % self.W
         v1 = torch.clamp(v0 + 1, 0, self.H - 1)
 
         du = (u - u0.float()).unsqueeze(0)
         dv = (v - v0.float()).unsqueeze(0)
 
-        w00 = (1 - du) * (1 - dv)
-        w01 = (1 - du) * dv
-        w10 = du * (1 - dv)
-        w11 = du * dv
+        w00 = ((1 - du) * (1 - dv)).view(-1)
+        w01 = ((1 - du) * dv).view(-1)
+        w10 = (du * (1 - dv)).view(-1)
+        w11 = (du * dv).view(-1)
 
-        view_flat = view.view(B, self.C, -1)
-        w00 = w00.view(-1)  # [height*width]
-        w01 = w01.view(-1)
-        w10 = w10.view(-1)
-        w11 = w11.view(-1)
+        view_flat = view.view(B, self.C, -1)  # [B, C, H*W]
+        n_pano = self.H * self.W
 
-        idx00 = (v0 * self.W + u0).view(-1)  # [height*width]
+        idx00 = (v0 * self.W + u0).view(-1)
         idx01 = (v1 * self.W + u0).view(-1)
         idx10 = (v0 * self.W + u1).view(-1)
         idx11 = (v1 * self.W + u1).view(-1)
 
-        for b in range(B):
+        pano_flat = self.equirect_tensor.view(B, self.C, -1)
+        accumulator = torch.zeros_like(pano_flat)
+        weight_sum = torch.zeros_like(pano_flat)
 
-            accumulator = torch.zeros_like(self.equirect_tensor.view(B, self.C, -1)[b])  # [B, C, H_pano*W_pano]
-            weight_sum = torch.zeros_like(self.equirect_tensor.view(B, self.C, -1)[b])  # [B, C, H_pano*W_pano]
+        # Vectorized scatter_add over B and C
+        for idx_flat, w in [(idx00, w00), (idx01, w01), (idx10, w10), (idx11, w11)]:
+            idx_bc = idx_flat.unsqueeze(0).unsqueeze(0).expand(B, self.C, -1)
+            w_bc = w.unsqueeze(0).unsqueeze(0).expand(B, self.C, -1)
+            accumulator.scatter_add_(2, idx_bc, view_flat * w_bc)
+            weight_sum.scatter_add_(2, idx_bc, w_bc)
 
-            for c in range(self.C):
-
-                accumulator[c].index_add_(0, idx00, view_flat[b, c] * w00)
-                accumulator[c].index_add_(0, idx01, view_flat[b, c] * w01)
-                accumulator[c].index_add_(0, idx10, view_flat[b, c] * w10)
-                accumulator[c].index_add_(0, idx11, view_flat[b, c] * w11)
-
-                weight_sum[c].index_add_(0, idx00, w00)
-                weight_sum[c].index_add_(0, idx01, w01)
-                weight_sum[c].index_add_(0, idx10, w10)
-                weight_sum[c].index_add_(0, idx11, w11)
-
-            mask = weight_sum > 0
-            self.equirect_tensor.view(B, self.C, -1)[b][mask] = accumulator[mask] / weight_sum[mask]
+        mask = weight_sum > 0
+        new_vals = torch.where(mask, accumulator / weight_sum, pano_flat)
+        if blend_alpha >= 1.0:
+            pano_flat[mask] = new_vals[mask]
+        else:
+            pano_flat[mask] = blend_alpha * new_vals[mask] + (1.0 - blend_alpha) * pano_flat[mask]
+        # pano_flat is a view of self.equirect_tensor, so in-place update is already done
 
     def set_view_tensor_no_interpolation(self, view_tensor, fov, theta, phi):
         if view_tensor.dim() == 3:
@@ -183,9 +181,9 @@ class PanoramaTensor:
         self.equirect_tensor = pano_flat.reshape(self.equirect_tensor.shape)
 
     def _sample_equirect_tensor_nearest(self, pano, u, v):
-
-        u0 = torch.floor(u).long()
-        v0 = torch.floor(v).long()
+        # round() for nearest-neighbor reduces average reprojection error vs floor()
+        u0 = torch.round(u).long()
+        v0 = torch.round(v).long()
 
         u0 = u0 % self.W
         v0 = torch.clamp(v0, 0, self.H - 1)
@@ -211,9 +209,9 @@ class PanoramaTensor:
         else:
             f = focal_length
 
-        # width, height = view.shape[-1], view.shape[-2]
-        x = torch.linspace(-width / 2, width / 2 - 1, steps=width, dtype=self.dtype, device=self.device)
-        y = torch.linspace(-height / 2, height / 2 - 1, steps=height, dtype=self.dtype, device=self.device)
+        # Centered pixel grid: x_i = (2i - (W-1))/2 to remove 0.5-pixel bias
+        x = torch.linspace(-(width - 1) / 2, (width - 1) / 2, steps=width, dtype=self.dtype, device=self.device)
+        y = torch.linspace(-(height - 1) / 2, (height - 1) / 2, steps=height, dtype=self.dtype, device=self.device)
         yv, xv = torch.meshgrid(y, x, indexing='ij')  # [height, width]
 
         zv = torch.full_like(xv, f)
@@ -239,8 +237,9 @@ class PanoramaTensor:
         lon = torch.atan2(xyz_rot[..., 0], xyz_rot[..., 2])  # [-pi, pi]
         lat = torch.asin(xyz_rot[..., 1])  # [-pi/2, pi/2]
         lon = (lon + 2 * torch.pi) % (2 * torch.pi)  # [0, 2*pi)
-        u = lon / (2 * torch.pi) * (self.W - 1)  # [height, width]
-        v = (lat + torch.pi / 2) / torch.pi * (self.H - 1)  # [height, width]
+        # u = lon/(2*pi)*W so W pixels span [0, 2*pi) without duplicating rightmost column
+        u = lon / (2 * torch.pi) * self.W  # [height, width], periodicity
+        v = (lat + torch.pi / 2) / torch.pi * (self.H - 1)  # poles are boundaries
 
         return u, v
 

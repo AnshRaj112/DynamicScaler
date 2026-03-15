@@ -41,7 +41,7 @@ class RingPanoramaTensor:
 
         u, v = self._get_uv(fov=fov, theta=theta, phi=phi, width=width, height=height)
 
-        grid_u = (u / (self.W - 1)) * 2 - 1  # [height, width]
+        grid_u = (u / self.W) * 2 - 1 if self.W > 1 else torch.zeros_like(u)
         grid_v = (v / (self.H - 1)) * 2 - 1  # [height, width]
         grid = torch.stack((grid_u, grid_v), dim=-1)  # [height, width, 2]
         grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, height, width, 2]
@@ -105,67 +105,57 @@ class RingPanoramaTensor:
         self.equirect_tensor_handler.set_window_latent(input_latent=pano, frame_begin=frame_begin, frame_end=frame_end)
 
     def set_view_tensor_bilinear(self, view_tensor, fov, theta, phi,
-                                 frame_begin=None, frame_end=None):
+                                 frame_begin=None, frame_end=None, blend_alpha=1.0):
 
         if view_tensor.dim() == 3:
             view_tensor = view_tensor.unsqueeze(0)  # [1, C, H, W]
 
-        leading_dims = view_tensor.shape[:-3]  # [*, C, H, W]
+        leading_dims = view_tensor.shape[:-3]
         B = torch.prod(torch.tensor(leading_dims)).item() if len(leading_dims) > 0 else 1
-        view = view_tensor.view(B, self.C, view_tensor.shape[-2], view_tensor.shape[-1]).clone()  # [B, C, height, width]
+        view = view_tensor.view(B, self.C, view_tensor.shape[-2], view_tensor.shape[-1])
 
         width, height = view.shape[-1], view.shape[-2]
-
         u, v = self._get_uv(fov=fov, theta=theta, phi=phi, width=width, height=height)
 
-        u0 = torch.floor(u).long()
-        v0 = torch.floor(v).long()
+        u0 = torch.floor(u).long().clamp(0, self.W - 1)
+        v0 = torch.floor(v).long().clamp(0, self.H - 1)
         u1 = (u0 + 1) % self.W
         v1 = torch.clamp(v0 + 1, 0, self.H - 1)
 
-        du = (u - u0.float()).unsqueeze(0)  # [1, height, width]
-        dv = (v - v0.float()).unsqueeze(0)  # [1, height, width]
+        du = (u - u0.float()).unsqueeze(0)
+        dv = (v - v0.float()).unsqueeze(0)
+        w00 = ((1 - du) * (1 - dv)).view(-1)
+        w01 = ((1 - du) * dv).view(-1)
+        w10 = (du * (1 - dv)).view(-1)
+        w11 = (du * dv).view(-1)
 
-        w00 = (1 - du) * (1 - dv)  # [1, height, width]
-        w01 = (1 - du) * dv
-        w10 = du * (1 - dv)
-        w11 = du * dv
+        view_flat = view.view(B, self.C, -1)
+        curr_equirect_torch_tensor = self.equirect_tensor_handler.get_window_latent(frame_begin=frame_begin, frame_end=frame_end)
+        pano_flat = curr_equirect_torch_tensor.view(B, self.C, -1)
+        accumulator = torch.zeros_like(pano_flat)
+        weight_sum = torch.zeros_like(pano_flat)
 
-        view_flat = view.view(B, self.C, -1)  # [B, C, height*width]
-        w00 = w00.view(-1)  # [height*width]
-        w01 = w01.view(-1)
-        w10 = w10.view(-1)
-        w11 = w11.view(-1)
-
-        idx00 = (v0 * self.W + u0).view(-1)  # [height*width]
+        idx00 = (v0 * self.W + u0).view(-1)
         idx01 = (v1 * self.W + u0).view(-1)
         idx10 = (v0 * self.W + u1).view(-1)
         idx11 = (v1 * self.W + u1).view(-1)
 
-        for b in range(B):
-            curr_equirect_torch_tensor = self.equirect_tensor_handler.get_window_latent(frame_begin=frame_begin, frame_end=frame_end)
-            accumulator = torch.zeros_like(curr_equirect_torch_tensor.view(B, self.C, -1)[b])  # [B, C, H_pano*W_pano]
-            weight_sum = torch.zeros_like(curr_equirect_torch_tensor.view(B, self.C, -1)[b])  # [B, C, H_pano*W_pano]
+        for idx_flat, w in [(idx00, w00), (idx01, w01), (idx10, w10), (idx11, w11)]:
+            idx_bc = idx_flat.unsqueeze(0).unsqueeze(0).expand(B, self.C, -1)
+            w_bc = w.unsqueeze(0).unsqueeze(0).expand(B, self.C, -1)
+            accumulator.scatter_add_(2, idx_bc, view_flat * w_bc)
+            weight_sum.scatter_add_(2, idx_bc, w_bc)
 
-            for c in range(self.C):
-                accumulator[c].index_add_(0, idx00, view_flat[b, c] * w00)
-                accumulator[c].index_add_(0, idx01, view_flat[b, c] * w01)
-                accumulator[c].index_add_(0, idx10, view_flat[b, c] * w10)
-                accumulator[c].index_add_(0, idx11, view_flat[b, c] * w11)
+        mask = weight_sum > 0
+        new_vals = torch.where(mask, accumulator / weight_sum, pano_flat)
+        if blend_alpha >= 1.0:
+            pano_flat[mask] = new_vals[mask]
+        else:
+            pano_flat[mask] = blend_alpha * new_vals[mask] + (1.0 - blend_alpha) * pano_flat[mask]
 
-                weight_sum[c].index_add_(0, idx00, w00)
-                weight_sum[c].index_add_(0, idx01, w01)
-                weight_sum[c].index_add_(0, idx10, w10)
-                weight_sum[c].index_add_(0, idx11, w11)
-
-            mask = weight_sum > 0
-
-            curr_equirect_torch_tensor.view(B, self.C, -1)[b][mask] = accumulator[mask] / weight_sum[mask]
-
-            self.equirect_tensor_handler.set_window_latent(input_latent=curr_equirect_torch_tensor,
-                                                           frame_begin=frame_begin, frame_end=frame_end)
-
-            # self.equirect_tensor.view(B, self.C, -1)[b][mask] = accumulator[mask] / weight_sum[mask]
+        curr_equirect_torch_tensor = pano_flat.view(curr_equirect_torch_tensor.shape)
+        self.equirect_tensor_handler.set_window_latent(input_latent=curr_equirect_torch_tensor,
+                                                       frame_begin=frame_begin, frame_end=frame_end)
 
     def set_view_tensor_no_interpolation(self, view_tensor, fov, theta, phi,
                                          frame_begin=None, frame_end=None):
@@ -199,13 +189,12 @@ class RingPanoramaTensor:
         # self.equirect_tensor = pano_flat.reshape(self.equirect_tensor.shape)
 
     def _sample_equirect_tensor_nearest(self, pano, u, v):
-
-        u0 = torch.floor(u).long()
-        v0 = torch.floor(v).long()
+        u0 = torch.round(u).long()
+        v0 = torch.round(v).long()
         u0 = u0 % self.W
         v0 = torch.clamp(v0, 0, self.H - 1)
 
-        sampled_view = pano[:, :, v0, u0].clone()  # [B, C, height, width]
+        sampled_view = pano[:, :, v0, u0]  # [B, C, height, width]; clone removed when not needed
         unsampled_mask = torch.ones_like(u0, dtype=self.dtype, device=self.device)  # [height, width]
         valid_mask = (u >= 0) & (u < self.W) & (v >= 0) & (v < self.H)
         unsampled_mask[~valid_mask] = 0
@@ -224,9 +213,9 @@ class RingPanoramaTensor:
         else:
             f = focal_length
 
-        # width, height = view.shape[-1], view.shape[-2]
-        x = torch.linspace(-width / 2, width / 2 - 1, steps=width, dtype=self.dtype, device=self.device)
-        y = torch.linspace(-height / 2, height / 2 - 1, steps=height, dtype=self.dtype, device=self.device)
+        # Centered pixel grid to remove 0.5-pixel bias
+        x = torch.linspace(-(width - 1) / 2, (width - 1) / 2, steps=width, dtype=self.dtype, device=self.device)
+        y = torch.linspace(-(height - 1) / 2, (height - 1) / 2, steps=height, dtype=self.dtype, device=self.device)
         yv, xv = torch.meshgrid(y, x, indexing='ij')  # [height, width]
 
         zv = torch.full_like(xv, f)
@@ -251,8 +240,7 @@ class RingPanoramaTensor:
         lon = torch.atan2(xyz_rot[..., 0], xyz_rot[..., 2])  # [-pi, pi]
         lat = torch.asin(xyz_rot[..., 1])  # [-pi/2, pi/2]
         lon = (lon + 2 * torch.pi) % (2 * torch.pi)  # [0, 2*pi)
-
-        u = lon / (2 * torch.pi) * (self.W - 1)  # [height, width]
+        u = lon / (2 * torch.pi) * self.W  # W pixels span [0, 2*pi) without duplication
         v = (lat + torch.pi / 2) / torch.pi * (self.H - 1)  # [height, width]
 
         return u, v
@@ -277,7 +265,7 @@ class RingPanoramaLatentProxy:
             interpolate_mode=interpolate_mode, interpolate_align_corners=interpolate_align_corners)
 
         B, N, C, H, W = view.shape
-        return view.permute(0, 2, 1, 3, 4).clone()
+        return view.permute(0, 2, 1, 3, 4)
 
     def get_view_tensor_no_interpolate(self, fov, theta, phi, width, height,
                                        frame_begin=None, frame_end=None):

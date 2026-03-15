@@ -1,0 +1,575 @@
+% Comprehensive Improvement Plan for DynamicScaler
+% AI/ML Engineer Analysis: Image Quality, Motion, Temporal, Scene, Q-Align, CLIP, Graphics, Frame Consistency, Mathematics, and Code
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{titlesec}
+
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, citecolor=green!40!black, urlcolor=cyan!50!black}
+
+\lstset{
+    language=Python,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red!70!black},
+    breaklines=true, frame=single, numbers=left, numberstyle=\tiny\color{gray},
+    showstringspaces=false, tabsize=4,
+}
+
+\definecolor{enhance}{RGB}{0,100,0}
+\newcommand{\enhance}[1]{\textcolor{enhance}{\textbf{#1}}}
+\newcommand{\file}[1]{\texttt{#1}}
+\newcommand{\fn}[1]{\texttt{#1}}
+
+\title{
+    \textbf{DynamicScaler: Comprehensive Improvement Plan} \\
+    \large Image Quality, Dynamic Degree, Motion Smoothness, Temporal Flickering, \\
+    Scene Richness, Q-Align, CLIP Score, Graphics, Frame Consistency \& Codebase Logic
+}
+\author{AI/ML Engineering Analysis}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document provides a full codebase-driven improvement plan for the DynamicScaler panoramic video generation pipeline. It covers \textbf{image quality}, \textbf{dynamic degree}, \textbf{motion smoothness}, \textbf{temporal flickering}, \textbf{scene} and \textbf{scene richness}, \textbf{Q-Align (I/V)}, \textbf{CLIP Score}, \textbf{graphics quality}, \textbf{frame consistency}, \textbf{motion pattern}, \textbf{running on low-memory GPUs (e.g.\ P100)} without losing much quality, and all related \textbf{mathematics} and \textbf{code logic}. Each section states the current behavior, the limitation, and the proposed change with equations and code where applicable.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{Overview}
+%==============================================================================
+
+DynamicScaler generates 360° panoramic videos via: equirectangular representation, gnomonic view extraction, per-view denoising with VideoCrafter, and shift-window merge. Improvements below target:
+
+\begin{itemize}
+    \item \textbf{Image quality}: VAE encode/decode, preprocessing, latent resizing, tiled blending.
+    \item \textbf{Dynamic degree}: Theta/phi scheduling, latitude-adaptive sampling, angular coverage.
+    \item \textbf{Motion smoothness}: Temporal CFG in sphere pipeline, timestep-dependent temporal guidance.
+    \item \textbf{Temporal flickering}: Overlap/merge schedules, post-decode temporal smoothing.
+    \item \textbf{Scene / scene richness}: Multi-prompt usage, latitude-adaptive views, multi-view score averaging.
+    \item \textbf{Q-Align (I) \& (V)}: Optional integration for image/video quality scoring (not in repo).
+    \item \textbf{CLIP Score}: Caching of text/image embeddings, consistent conditioning.
+    \item \textbf{Graphics quality}: Latent interpolation mode, re-noising formula, anti-aliasing.
+    \item \textbf{Frame consistency}: Merge ratios, overlap scheduling, loop/merge logic.
+    \item \textbf{Motion pattern}: Temporal attention and relative position usage.
+    \item \textbf{Low-GPU operation}: Changes to run on limited VRAM (e.g.\ GPU P100, 16\,GB) with minimal quality loss.
+\end{itemize}
+
+%==============================================================================
+\section{Image Quality}
+%==============================================================================
+
+\subsection{VAE and Preprocessing Consistency}
+
+\textbf{Current:} \file{precast\_latent\_utils.py} uses \fn{transforms.Resize} and \fn{Normalize(mean=[0,0,0], std=[1,1,1])}; \file{tensor\_utils.py} and \file{funcs.py} use \fn{cv2.resize(..., INTER\_LINEAR)} and \fn{(x/255.-0.5)*2}. Different resize backends (PIL/Lanczos vs OpenCV bilinear) yield different pixel values.
+
+\textbf{Change:}
+\begin{enumerate}
+    \item Use a single resize path everywhere: e.g.\ \fn{cv2.resize(..., cv2.INTER\_AREA)} for downscale, \fn{cv2.INTER\_LANCZOS4} for upscale, or \fn{torchvision.transforms.Resize(..., antialias=True)}.
+    \item Remove the no-op \fn{Normalize(mean=[0,0,0], std=[1,1,1])} from the transform pipeline.
+    \item Normalize to $[-1,1]$ once: \fn{(img/255. - 0.5) * 2}.
+\end{enumerate}
+
+\subsection{Tiled VAE Encoding and Tile Boundaries}
+
+\textbf{Current:} \fn{tiled\_vae\_encode\_tensor\_simple()} uses a fixed $4\times 4$ grid with 32-pixel overlap and \emph{uniform} averaging of overlapping tile latents, which can leave visible seams.
+
+\textbf{Change:} Use Gaussian- or cosine-tapered weights in the overlap region:
+\begin{equation}
+W_k(x,y) = \prod_{d\in\{x,y\}} \begin{cases}
+\frac{1}{2}\left(1 + \cos\frac{\pi(d-d_0)}{O}\right) & d \in \text{overlap} \\
+1 & \text{otherwise}
+\end{cases}, \quad
+L_{\text{fused}} = \frac{\sum_k W_k L_k}{\sum_k W_k}.
+\end{equation}
+Make tile count and overlap size resolution-adaptive instead of fixed constants.
+
+\subsection{Latent Resizing and Upscaling Artifacts}
+
+\textbf{Current:} \file{diffusion\_utils.py} uses \fn{F.interpolate(..., mode='nearest')} in sphere pipeline and in \file{gen\_pano\_360.py} for downsampling before 1x planar stage. Nearest-neighbor upscaling introduces blockiness.
+
+\textbf{Change:}
+\begin{enumerate}
+    \item Use \texttt{bilinear} or \texttt{bicubic} for all latent resizing, especially upscaling.
+    \item Optionally apply a light Gaussian blur to upsampled latents before re-noising: $L_{\text{smooth}} = G_\sigma * L_{\text{upsampled}}$ with $\sigma \approx 0.5$--$1.0$ to suppress high-frequency artifacts.
+\end{enumerate}
+
+%==============================================================================
+\section{Dynamic Degree and Angular Coverage}
+%==============================================================================
+
+\subsection{Theta Offset and Integer Division}
+
+\textbf{Current:} \file{i2v\_sphere\_panorama\_pipeline.py} uses \fn{theta\_offset = (i \% loop\_step\_theta) * (view\_fov // loop\_step\_theta)}, so for \fn{view\_fov=120}, \fn{loop\_step\_theta=10} the step is $12°$. For non-divisible pairs, integer division leaves angular gaps.
+
+\textbf{Change:} Use floating-point division for full coverage:
+\begin{equation}
+\theta_{\text{offset}} = (i \bmod N) \cdot \frac{\text{FoV}}{N}.
+\end{equation}
+\begin{lstlisting}
+theta_offset = (i % loop_step_theta) * (view_fov / loop_step_theta)
+\end{lstlisting}
+
+\subsection{Latitude-Adaptive Theta Sampling (Scene Richness)}
+
+\textbf{Current:} \fn{phi\_theta\_dict} in \file{gen\_pano\_360.py} uses the same number of theta samples for most $\phi$ (e.g.\ 6 for $\phi\in\{75,-75,0\}$). Near the poles this over-samples; at the equator it may under-sample.
+
+\textbf{Change:} Scale theta count by $\cos\phi$ for roughly uniform solid-angle coverage:
+\begin{equation}
+N_\theta(\phi) = \max\left(1, \left\lfloor N_0 \cdot \cos(\phi \cdot \pi/180)\right\rfloor\right).
+\end{equation}
+This improves scene richness at the equator and reduces redundant work at the poles.
+
+%==============================================================================
+\section{Motion Smoothness and Temporal Guidance}
+%==============================================================================
+
+\subsection{Enable Temporal CFG in Sphere Pipeline}
+\label{sec:motion}
+
+\textbf{Current:} \file{scripts/evaluation/funcs.py} supports \fn{conditional\_guidance\_scale\_temporal} in \fn{batch\_ddim\_sampling}, and \file{ddim.py} implements:
+\begin{equation}
+\epsilon_t \leftarrow \epsilon_t + \lambda_{\text{temp}} \cdot (\epsilon_t^{\text{temporal}} - \epsilon_t^{\text{image}}),
+\end{equation}
+where $\epsilon_t^{\text{image}}$ is from \fn{apply\_model(..., no\_temporal\_attn=True)}. The sphere panorama path in \file{i2v\_sphere\_panorama\_pipeline.py} never passes \fn{conditional\_guidance\_scale\_temporal} and does not call the model with \fn{no\_temporal\_attn}; it only uses text+image CFG.
+
+\textbf{Change:}
+\begin{enumerate}
+    \item Add a \fn{temporal\_guidance\_scale} (or reuse \fn{conditional\_guidance\_scale\_temporal}) argument to \fn{basic\_sample\_shift\_shpere\_panorama}.
+    \item When calling \fn{self.pretrained\_t2v.model(...)}, perform two forward passes when \fn{temporal\_guidance\_scale} is set: one with temporal attention and one with \fn{no\_temporal\_attn=True}, then combine as in \file{ddim.py}. Alternatively, use the same DDIM step helper that accepts temporal guidance.
+\end{enumerate}
+This directly improves \textbf{motion smoothness} and \textbf{frame consistency} by strengthening temporal coherence.
+
+\subsection{Timestep-Dependent Temporal Guidance (Motion Pattern)}
+
+\textbf{Current:} If temporal guidance is used, it uses a constant scale. Early steps define coarse motion; later steps refine details. A constant scale may over-constrain at high noise and under-constrain at low noise.
+
+\textbf{Change:} Use a schedule for temporal guidance scale, e.g.\
+\begin{equation}
+\lambda_{\text{temp}}(t) = \lambda_{\max} \cdot \frac{\bar{\alpha}_t}{1-\bar{\alpha}_t} \cdot c,
+\end{equation}
+with $c$ chosen so that $\lambda_{\text{temp}}$ is stronger in the middle of the schedule and tapers at the start/end. This can improve \textbf{motion pattern} consistency without over-smoothing.
+
+%==============================================================================
+\section{Temporal Flickering}
+%==============================================================================
+
+\subsection{Overlap Ratio Schedule}
+
+\textbf{Current:} In \file{gen\_pano\_360.py}, \fn{overlap\_ratio\_list\_1\_f} is built from \fn{[0.75, 0.5]} by indexing with \fn{i * len(...) // num\_inference\_steps}, giving an abrupt step from 0.75 to 0.5.
+
+\textbf{Change:} Use smooth cosine annealing:
+\begin{equation}
+r(t) = r_{\max} - \frac{r_{\max}-r_{\min}}{2}\left(1 - \cos\frac{\pi t}{T}\right), \quad r_{\max}=0.75,\; r_{\min}=0.5.
+\end{equation}
+This reduces visible temporal seam artifacts and flicker at the transition.
+
+\subsection{Merge-Previous-Denoised Ratio Decay}
+
+\textbf{Current:} \fn{merge\_prev\_denoised\_ratio\_list} uses linear decay: \fn{max\_ratio * (1 - t / merge\_prev\_step)} for \fn{t < merge\_prev\_step}, then 0. Linear decay can over-blend during detail refinement.
+
+\textbf{Change:} Use exponential or cosine decay so blending is strong early and drops in the refinement phase:
+\begin{equation}
+\lambda(t) = \lambda_{\max} \cdot \exp\left(-\frac{\gamma t}{T_{\text{merge}}}\right)
+\quad\text{or}\quad
+\lambda(t) = \frac{\lambda_{\max}}{2}\left(1 + \cos\frac{\pi t}{T_{\text{merge}}}\right).
+\end{equation}
+
+\subsection{Post-Decode Temporal Smoothing}
+\label{sec:flicker}
+
+\textbf{Current:} \fn{save\_decoded\_video\_latents()} in \file{loop\_merge\_utils.py} decodes frame-by-frame and saves with no temporal filtering.
+
+\textbf{Change:} Add an optional 1D temporal smoothing pass over the decoded frames (e.g.\ Gaussian or bilateral along time) before building the video list. This can reduce inter-frame flickering without changing the diffusion trajectory.
+
+%==============================================================================
+\section{Scene and Scene Richness}
+%==============================================================================
+
+\subsection{Multi-View Score Averaging (Global Coherence)}
+
+\textbf{Current:} Each perspective view is denoised independently with CFG; consistency across views relies only on overlap merging.
+
+\textbf{Change:} Before applying the DDIM step, average noise predictions from overlapping views for pixels that lie in multiple views:
+\begin{equation}
+\hat{\epsilon}_{\text{avg}}(p) = \frac{\sum_{v \in \mathcal{V}(p)} w_v \cdot \hat{\epsilon}_v(p)}{\sum_{v \in \mathcal{V}(p)} w_v},
+\end{equation}
+with $w_v$ e.g.\ $w_v \propto \cos(\phi_v)$ for sphere-aware weighting. This improves \textbf{scene richness} and global panorama coherence (MultiDiffusion-style).
+
+\subsection{Phi-Prompt and Theta Coverage}
+
+Keeping latitude-adaptive $N_\theta(\phi)$ and consistent use of \fn{phi\_prompt\_dict} (and \fn{window\_multi\_prompt\_dict} where used) ensures scene content matches elevation and avoids under-sampling at the equator.
+
+%==============================================================================
+\section{Q-Align (I) and Q-Align (V) Integration}
+%==============================================================================
+
+The codebase does not currently include Q-Align. The following is a \textbf{proposed integration} for image/video quality alignment.
+
+\subsection{Q-Align (I) -- Image Quality}
+
+\begin{itemize}
+    \item \textbf{Purpose:} Align generated frames with perceived image quality (e.g.\ resolution, sharpness, aesthetics).
+    \item \textbf{Integration:} Add an optional module that runs a Q-Align image scorer on decoded frames (or on a downsampled subset). Use scores to:
+    \begin{enumerate}
+        \item Select or rank outputs (e.g.\ best of $k$ samples).
+        \item Optionally define a lightweight refinement loss or rejection step (if integrating into a training or iterative refinement loop).
+    \end{enumerate}
+    \item \textbf{Code:} New file e.g.\ \file{utils/quality\_metrics.py} with \fn{compute\_qalign\_image\_score(frames)} calling an external Q-Align (I) API or local model; hook into \fn{save\_decoded\_video\_latents} or the main loop to log/select by score.
+\end{itemize}
+
+\subsection{Q-Align (V) -- Video Quality}
+
+\begin{itemize}
+    \item \textbf{Purpose:} Align with temporal consistency, motion naturalness, and video-level quality.
+    \item \textbf{Integration:} Run Q-Align (V) on the full decoded video (or key segments) to score temporal consistency and motion. Use for:
+    \begin{enumerate}
+        \item Reporting and ablation (e.g.\ compare overlap schedules, temporal guidance).
+        \item Optional best-of-$k$ selection over multiple runs.
+    \end{enumerate}
+    \item \textbf{Code:} In \file{utils/quality\_metrics.py}, add \fn{compute\_qalign\_video\_score(video\_tensor\_or\_path)} and call after saving the final mp4.
+\end{itemize}
+
+\subsection{CLIP Score}
+
+\begin{itemize}
+    \item \textbf{Current:} Conditioning uses OpenCLIP text and image embeddings; there is no explicit CLIP-based quality metric.
+    \item \textbf{Change:} Add optional CLIP Score computation: cosine similarity between (1) text embedding of the prompt and (2) frame-level or averaged image embeddings of generated frames. Expose in \file{utils/quality\_metrics.py} and log or return from the pipeline for tuning guidance scale and prompts.
+\end{itemize}
+
+%==============================================================================
+\section{Graphics Quality and Re-noising}
+%==============================================================================
+
+\subsection{Re-noising Formula (DDIM-Aware)}
+
+\textbf{Current:} \file{scheduler.py} \fn{re\_noise()} uses:
+\begin{equation}
+x_b = \sqrt{\frac{\bar{\alpha}_b}{\bar{\alpha}_a}}\, x_a + \sqrt{1 - \frac{\bar{\alpha}_b}{\bar{\alpha}_a}}\, \tilde{\epsilon},
+\end{equation}
+with fresh Gaussian $\tilde{\epsilon}$, which does not preserve the original noise trajectory.
+
+\textbf{Change:} Use DDIM-inversion-style re-noising when moving from step $a$ to $b$:
+\begin{align}
+\hat{x}_0 &\approx (x_a - \sqrt{1-\bar{\alpha}_a}\,\hat{\epsilon}_a) / \sqrt{\bar{\alpha}_a}, \\
+x_b &= \sqrt{\bar{\alpha}_b}\,\hat{x}_0 + \sqrt{1-\bar{\alpha}_b-\sigma_b^2}\,\hat{\epsilon}_a + \sigma_b\,\epsilon,
+\end{align}
+where $\hat{\epsilon}_a$ comes from one denoising step at $a$. This preserves structure across the upscaling chain and improves \textbf{graphics quality} after 2x upscale.
+
+\subsection{Latent Interpolation and Anti-Aliasing}
+
+Already covered in Image Quality: use bilinear/bicubic for latent resize and optional Gaussian smoothing before re-noising to avoid blocky or aliased latents.
+
+%==============================================================================
+\section{Frame Consistency and Merge Logic}
+%==============================================================================
+
+\subsection{Merge Ratios and Masks}
+
+\textbf{Current:} \fn{mix\_latents\_with\_mask} in \file{tensor\_utils.py} blends \fn{latent\_1} and \fn{latent\_to\_add} with \fn{mix\_ratio} inside the mask; outside the mask, \fn{latent\_1} is kept unchanged. Overlap merge uses \fn{merge\_renoised\_overlap\_latent\_ratio} and \fn{merge\_prev\_denoised\_ratio\_list}.
+
+\textbf{Change:} No formula change; ensure the \textbf{smooth overlap schedule} and \textbf{cosine/exponential merge decay} above are used so that frame-to-frame transitions are smooth and detail phase is less blended. This directly supports \textbf{frame consistency}.
+
+\subsection{Loop and Dock-at-Frame}
+
+Keep \fn{dock\_at\_f} and \fn{loop\_step\_frame} logic as is; optional improvement is to document and optionally parameterize the loop alignment (e.g.\ first/last frame alignment) for different content types.
+
+%==============================================================================
+\section{Motion Pattern and Temporal Attention}
+%==============================================================================
+
+\subsection{Temporal Attention and Relative Position}
+
+\textbf{Current:} \file{lvdm/modules/attention.py} uses \fn{RelativePosition} for temporal attention with \fn{max\_relative\_position = temporal\_length}. The UNet 3D in \file{openaimodel3d.py} uses \fn{temporal\_conv} and \fn{temporal\_attention}; the sampler can bypass temporal attention via \fn{no\_temporal\_attn} for the “image” branch of temporal CFG.
+
+\textbf{Change:} No structural change required. Ensuring \textbf{temporal CFG is used in the sphere pipeline} (see Section~3.1) will better exploit existing temporal attention for \textbf{motion pattern} consistency. Optionally, expose \fn{conditional\_guidance\_scale\_temporal} in \file{gen\_pano\_360.py} and pass it through to the sphere pipeline.
+
+%==============================================================================
+\section{Mathematics: Projection and Sampling}
+%==============================================================================
+
+\subsection{Pixel Grid Centering}
+
+\textbf{Current:} In \file{panorama\_tensor\_utils.py} and \file{ring\_panorama\_tensor\_utils.py}, \fn{\_get\_uv()} builds the grid with \fn{torch.linspace(-width/2, width/2-1, steps=width)}, which is asymmetric for even width and introduces a 0.5-pixel bias.
+
+\textbf{Change:} Use a centered grid:
+\begin{equation}
+x_i = \frac{2i - (W-1)}{2}, \quad i=0,\ldots,W-1.
+\end{equation}
+\begin{lstlisting}
+x = torch.linspace(-(width-1)/2, (width-1)/2, steps=width)
+y = torch.linspace(-(height-1)/2, (height-1)/2, steps=height)
+\end{lstlisting}
+
+\subsection{Longitude Normalization}
+
+\textbf{Current:} $u = \frac{\text{lon}}{2\pi}(W-1)$ maps the rightmost column to $\text{lon}=2\pi$, duplicating the leftmost column.
+
+\textbf{Change:} Use $u = \frac{\text{lon}}{2\pi} W$ for horizontal periodicity so $W$ pixels span $[0,2\pi)$ without duplication. Keep $v = \frac{\text{lat}+\pi/2}{\pi}(H-1)$ for vertical (poles are true boundaries).
+
+\subsection{Nearest-Neighbor Sampling}
+
+\textbf{Current:} \fn{\_sample\_equirect\_tensor\_nearest()} uses \fn{torch.floor(u).long()} (and same for $v$), which biases downward.
+
+\textbf{Change:} Use \fn{torch.round(u).long()} and \fn{torch.round(v).long()} for nearest-neighbor to reduce average reprojection error.
+
+\subsection{Bilinear Splatting in \fn{set\_view\_tensor\_bilinear}}
+
+\textbf{Current:} Nested Python loops over batch and channel with \fn{index\_add\_}; overlapping writes overwrite panorama content.
+
+\textbf{Change:} (1) Vectorize with batched \fn{scatter\_add\_} (or equivalent) across $B \times C$. (2) Blend with existing panorama using a factor $\alpha$: $P_{\text{new}} = \alpha \cdot \frac{\sum_k w_k V_k}{\sum_k w_k} + (1-\alpha) P_{\text{old}}$.
+
+%==============================================================================
+\section{Classifier-Free Guidance}
+%==============================================================================
+
+\subsection{Dynamic Guidance Scaling}
+
+\textbf{Current:} Constant \fn{guidance\_scale} $s$ can over-saturate at low noise levels.
+
+\textbf{Change:} Use timestep-dependent scaling, e.g.\
+\begin{equation}
+s(t) = s_{\max} \cdot \left(\frac{\bar{\alpha}_t}{1-\bar{\alpha}_t}\right)^{-\beta}, \quad \beta \approx 0.1,
+\end{equation}
+or the guidance rescale from Lin et al.: $\hat{\epsilon}_{\text{rescaled}} = \phi \cdot \hat{\epsilon}_{\text{cfg}} + (1-\phi) \cdot \hat{\epsilon}_{\text{cfg}} \cdot \frac{\|\epsilon_{\text{cond}}\|}{\|\hat{\epsilon}_{\text{cfg}}\|}$ to avoid over-exposure while keeping prompt adherence.
+
+%==============================================================================
+\section{Code and Performance}
+%==============================================================================
+
+\subsection{Cache VAE Encoding}
+
+\textbf{Current:} In \fn{basic\_sample\_shift\_shpere\_panorama()}, when \fn{paste\_on_static} is True, \fn{tiled\_vae\_encode\_image(pano\_image\_path, ...)} is called inside the timestep loop, giving identical encoding every time.
+
+\textbf{Change:} Encode once before the loop and reuse:
+\begin{lstlisting}
+cached_frame_0_latent = self.tiled_vae_encode_image(
+    image_path=pano_image_path, image_size=(equirect_height, equirect_width))
+for i, t in enumerate(timesteps):
+    if paste_on_static and i < total_steps - 1:
+        frame_0_latent = cached_frame_0_latent
+\end{lstlisting}
+
+\subsection{Cache Prompt and Image Embeddings}
+
+\textbf{Current:} Text and image embeddings are recomputed per view per timestep in the sphere pipeline.
+
+\textbf{Change:} Precompute and cache:
+\begin{lstlisting}
+phi_text_emb_cache = {phi: self.pretrained_t2v.get_learned_conditioning([prompt])
+                     for phi, prompt in phi_prompt_dict.items()}
+# Cache image embeddings per (theta, phi) view key before the denoising loop
+\end{lstlisting}
+Reuse \fn{phi\_text\_emb\_cache[phi\_angle]} and cached image emb for the same view across timesteps. This improves throughput and keeps \textbf{CLIP} conditioning consistent.
+
+\subsection{Redundant \fn{.clone()} Audit}
+
+\textbf{Current:} Many \fn{.clone()} calls (e.g.\ in \file{ring\_panorama\_tensor\_utils.py}, \file{scheduler.py}) on tensors that are not reused, increasing memory.
+
+\textbf{Change:} Remove clones where the tensor is only consumed once; keep clones where in-place ops (e.g.\ \fn{scatter\_}, \fn{index\_add\_}) would otherwise corrupt shared buffers.
+
+\subsection{Video Save and Batching}
+
+\textbf{Current:} \fn{save\_decoded\_video\_latents()} decodes and converts frames one-by-one in a Python loop.
+
+\textbf{Change:} (1) Decode in mini-batches where possible (e.g.\ by slicing \fn{decoded\_video\_latents} along the time dimension). (2) Use batched \fn{tensor2image} or \fn{torchvision.utils.save\_image} for efficiency. (3) Add optional temporal smoothing (see Section~4.3) before appending to \fn{video\_frames\_img\_list}.
+
+%==============================================================================
+\section{Running on Low-Memory GPUs (e.g.\ P100) Without Losing Quality}
+%==============================================================================
+
+Target GPUs: NVIDIA P100 (16\,GB VRAM), T4 (16\,GB), or consumer cards with 8--12\,GB. The goal is to keep visual and temporal quality as high as possible while fitting in memory and avoiding OOM.
+
+\subsection{Memory Budget and Precision: FP16, FP8, or FP4}
+
+\textbf{Current:} Pipeline runs in FP32 by default; \file{gen\_pano\_360.py} can enable FP16 via \fn{use\_fp16} and \fn{model\_config['params']['unet\_config']['params']['use\_fp16']}. P100 supports FP16 (no Tensor Cores); FP16 still reduces memory and can be stable for inference.
+
+\textbf{Changes:} Support a \textbf{precision tier} when on low GPU (e.g.\ P100): choose \textbf{FP16}, \textbf{FP8}, or \textbf{FP4} to trade off memory vs quality.
+
+\begin{enumerate}
+    \item Add a \textbf{low\_memory} or \textbf{device\_tier} config (e.g.\ \fn{"p100"} / \fn{"t4"} / \fn{"high"}) and a \textbf{precision} or \fn{compute\_dtype} option: \fn{"fp16"}, \fn{"fp8"}, or \fn{"fp4"}. When set to \fn{"p100"} or \fn{"low"}:
+    \begin{itemize}
+        \item \textbf{FP16}: Use FP16 for UNet and VAE inference where numerically stable (test on P100; fallback to FP32 for VAE decode if needed). Best quality of the three; halves memory vs FP32.
+        \item \textbf{FP8}: Use 8-bit floating point (e.g.\ E4M3/E5M2) for weights and optionally activations. On P100 (no native FP8 hardware), implement via: (a) casting weights to FP8 and computing in FP16/FP32 (PyTorch \fn{torch.float8\_e4m3fn} / \fn{float8\_e5m2} or transformer-engine style), or (b) loading a pre-quantized FP8 checkpoint. Cuts memory further (roughly half again vs FP16) with a small quality drop; useful when FP16 still OOMs.
+        \item \textbf{FP4}: Use 4-bit quantization for the UNet (and optionally VAE) weights. Implement via \fn{bitsandbytes} (NF4), GPTQ, or similar; compute can stay in FP16. Lowest memory (about 4$\times$ smaller weights than FP32), with a noticeable but often acceptable quality loss on low-memory GPUs. Enable only when FP8 is still too heavy.
+        \item Keep conditioning (CLIP, etc.) in FP32 or FP16 consistently to avoid dtype mismatches; do not quantize conditioning to FP8/FP4.
+    \end{itemize}
+    \item Precedence: on P100, support \fn{fp16} (default for low tier), \fn{fp8}, and \fn{fp4}. On Ampere+, optionally support \textbf{BF16} as well; on Hopper/Ada, native FP8 can be used when \fn{precision="fp8"}.
+    \item Code-level: add a single knob, e.g.\ \fn{--precision fp16|fp8|fp4} or \fn{low\_memory\_precision} in config, that drives dtype and whether to load quantized weights (for FP8/FP4).
+\end{enumerate}
+
+\subsection{Resolution and Spatial Tiling}
+
+\textbf{Current:} Default equirect e.g.\ $1024\times 512$ (or $2048\times 1024$ with \fn{upscale\_factor}); full panorama latent is $B\times C\times T\times H\times W$ and can exceed 16\,GB with many frames or 2x upscale.
+
+\textbf{Changes:}
+\begin{enumerate}
+    \item \textbf{Configurable base resolution}: Allow \fn{equirect\_width} / \fn{equirect\_height} to be set lower for low-memory mode (e.g.\ $512\times 256$ or $768\times 384$). Quality loss is moderate if aspect ratio and view FOV are preserved; upscale can still run at 2x on the reduced base.
+    \item \textbf{Smaller view window}: Reduce \fn{height}/\fn{width} per view (e.g.\ 320$\times$512 → 256$\times$384) so each UNet forward uses less memory. Slightly smaller views can be merged the same way; quality impact is limited if overlap and merge logic are unchanged.
+    \item \textbf{Tiled VAE with more, smaller tiles}: In \fn{tiled\_vae\_encode\_tensor\_simple}, use more tiles (e.g.\ $6\times 6$ or $8\times 4$) with the same or slightly smaller overlap so each tile encode fits in VRAM. Peak memory is bounded by one tile instead of full image.
+    \item \textbf{Tiled VAE decode}: Add an optional \fn{tiled\_vae\_decode} for the final video (and for 1x planar stage if needed). Decode the panorama in overlapping spatial tiles and blend with the same Gaussian/cosine weights as in Section~2.2. This avoids holding the full decoded video in GPU memory.
+\end{enumerate}
+
+\subsection{Temporal Chunking and Frame Window}
+
+\textbf{Current:} \fn{loop\_step\_frame} controls how many frames are processed per window; full sphere latent has \fn{total\_f} frames (e.g.\ 16 or 64). Large \fn{total\_f} with full spatial size can OOM on P100.
+
+\textbf{Changes:}
+\begin{enumerate}
+    \item \textbf{Cap total frames in low-memory mode}: Use a lower \fn{total\_f} (e.g.\ 16 instead of 64) for the sphere stage when \fn{low\_memory=True}, then optionally stitch or loop in post. Shorter clips reduce peak latent size.
+    \item \textbf{Smaller \fn{loop\_step\_frame}}: Process fewer frames per window (e.g.\ 4 or 8 instead of 16) so each UNet forward sees fewer frames; merge overlapping windows as now. Slightly more passes but each pass fits in VRAM; quality can be preserved with the same overlap/merge schedules.
+    \item \textbf{Sequential view processing}: Already done per view; ensure only one view’s latent and one model forward are resident at a time (no batching of views). Explicitly \fn{del} or reassign view tensors after \fn{set\_view\_tensor} and call \fn{torch.cuda.empty\_cache()} between views or every $k$ views in low-memory mode.
+\end{enumerate}
+
+\subsection{UNet and Attention Memory}
+
+\textbf{Current:} UNet 3D processes $B\times C\times T\times H\times W$; temporal and spatial attention can use a lot of memory on long sequences or large spatial size.
+
+\textbf{Changes:}
+\begin{enumerate}
+    \item \textbf{Attention slicing (optional)}: In \file{lvdm/modules/attention.py} (and freetraj if used), add an optional path that splits the sequence (temporal or spatial) into chunks, runs attention per chunk, and concatenates. This increases compute slightly but lowers peak memory. Enable only when \fn{low\_memory=True}.
+    \item \textbf{VAE offload}: After encoding the panorama (or each tile), move the encoded latent to CPU and bring back to GPU only the current view’s slice. After each view’s denoising step, write back to the CPU-held panorama and free GPU view tensor. This trades CPU–GPU transfer for lower VRAM.
+\end{enumerate}
+
+\subsection{Fewer Inference Steps Without Losing Quality}
+
+\textbf{Current:} \fn{num\_inference\_steps} (e.g.\ 48) controls DDIM steps. Fewer steps reduce compute and memory (fewer intermediate tensors over time).
+
+\textbf{Changes:}
+\begin{enumerate}
+    \item Use a \textbf{quality-preserving schedule} for fewer steps: e.g.\ \fn{ddim\_discretize="quad"} or LCM-style timesteps (already in \file{utils\_diffusion.py}) so that 20--25 steps give similar perceptual quality to 50 steps. In low-memory mode, set default \fn{num\_inference\_steps} to this reduced value.
+    \item Keep \textbf{smooth overlap and merge decay} (Sections~4.1--4.2); they help even with fewer steps by reducing seam visibility.
+\end{enumerate}
+
+\subsection{Caching and Redundant Work}
+
+All caching from Section~13 (VAE encode, prompt embeddings, image embeddings) is \textbf{especially important} on P100: it reduces both compute and the number of large tensors created. Ensure:
+\begin{itemize}
+    \item Single VAE encode of the panorama (or per tile) and reuse.
+    \item Precomputed \fn{phi\_text\_emb\_cache} and per-view image embeddings so no extra CLIP/VAE passes occur inside the denoising loop.
+\end{itemize}
+
+\subsection{Releasing Memory Between Stages}
+
+\textbf{Current:} \file{gen\_pano\_360.py} runs sphere → planar 1x → planar 2x in sequence. Intermediate latents are kept for the next stage.
+
+\textbf{Changes:}
+\begin{enumerate}
+    \item After each major stage (sphere, 1x, 2x), call \fn{torch.cuda.empty\_cache()} and optionally \fn{gc.collect()}. Delete references to large tensors that are no longer needed (e.g.\ after \fn{save\_decoded\_video\_latents} for an intermediate result).
+    \item For 2x upscale, load the 1x latent from CPU if it was offloaded, or from a saved file, instead of keeping it on GPU for the whole run. This keeps peak memory to one stage at a time.
+\end{enumerate}
+
+\subsection{Recommended Low-Memory Preset (P100)}
+
+A single \textbf{low\_memory} or \textbf{device\_tier="p100"} preset can apply. When on a low GPU like P100, precision can be set to \textbf{FP16}, \textbf{FP8}, or \textbf{FP4} depending on how much VRAM is available:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Parameter} & \textbf{Normal} & \textbf{P100 (FP16)} & \textbf{P100 (FP8/FP4)} \\
+\midrule
+Equirect resolution & 1024$\times$512 (or 2x) & 512$\times$256 base & 512$\times$256 or lower \\
+View size (H$\times$W) & 320$\times$512 & 256$\times$384 & 256$\times$384 \\
+VAE tiles & 4$\times$4 & 6$\times$6 or 8$\times$4 & 6$\times$6 or 8$\times$4 \\
+\fn{total\_f} (sphere) & 16--64 & 16 & 16 \\
+\fn{loop\_step\_frame} & 8--16 & 4--8 & 4--8 \\
+\fn{num\_inference\_steps} & 48 & 24--28 (quad/LCM) & 24--28 (quad/LCM) \\
+Precision & FP32 / FP16 & FP16 & \textbf{FP8} or \textbf{FP4} \\
+Tiled VAE decode & No & Yes (optional) & Yes (recommended) \\
+\fn{empty\_cache} between stages & No & Yes & Yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+    \item Use \textbf{FP16} first on P100; if still OOM, switch to \textbf{FP8} (smaller quality drop) or \textbf{FP4} (lowest memory, slightly more quality loss).
+    \item FP8 on P100: software emulation or FP8-weight storage with FP16 compute; on newer GPUs (Hopper/Ada), use native FP8 when available.
+    \item FP4: 4-bit quantized UNet (e.g.\ via bitsandbytes NF4); keep VAE in FP16 if possible.
+\end{itemize}
+
+With these changes, the codebase can run on a P100 (16\,GB) with a modest drop in resolution and steps; quality is preserved by keeping overlap/merge logic, smooth schedules, and optional temporal guidance, and by avoiding unnecessary recomputation through caching. Choosing FP8 or FP4 when needed allows running on even tighter VRAM without sacrificing more quality than necessary.
+
+%==============================================================================
+\section{Summary Table}
+%==============================================================================
+
+\begin{table}[H]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{0.22\textwidth}p{0.12\textwidth}p{0.08\textwidth}p{0.42\textwidth}@{}}
+\toprule
+\textbf{Enhancement} & \textbf{Category} & \textbf{Impact} & \textbf{Benefit} \\
+\midrule
+Unified preprocessing \& resize & Image quality & Medium & Consistent pixels, fewer artifacts \\
+Gaussian/cosine tiled VAE blend & Image quality & Medium & Smoother tile boundaries \\
+Bilinear/bicubic latent resize & Graphics & Medium & Less blocky upscaling \\
+Gaussian blur before re-noise & Graphics & Low--Med & Fewer high-freq artifacts \\
+Float theta offset & Dynamic degree & Low & Full angular coverage \\
+Latitude-adaptive $N_\theta(\phi)$ & Scene richness & High & Uniform coverage, fewer poles views \\
+Temporal CFG in sphere pipeline & Motion / Frame & High & Stronger temporal coherence \\
+Temporal guidance schedule & Motion pattern & Medium & Better motion consistency \\
+Smooth overlap schedule & Temporal flicker & Medium & Fewer seam/flicker artifacts \\
+Cosine/exp merge decay & Temporal flicker & Medium & Sharper details, less over-blend \\
+Post-decode temporal smoothing & Temporal flicker & Low--Med & Reduces inter-frame flicker \\
+Multi-view score averaging & Scene richness & High & Global panorama coherence \\
+Q-Align (I)/(V) integration & Quality metrics & Optional & Image/video quality alignment \\
+CLIP Score logging & CLIP Score & Low & Prompt–frame alignment monitoring \\
+DDIM-aware re-noising & Graphics & High & Better upscale structure \\
+Pixel grid centering & Math & Medium & Removes 0.5 px projection bias \\
+Longitude normalization & Math & Medium & No 360° column duplication \\
+Nearest-neighbor rounding & Math & Low & Lower reprojection error \\
+Bilinear splat vectorize + blend & Code/Math & High & Speed + correct overwrite \\
+Dynamic CFG scaling & Logic & High & Less over-saturation \\
+Cached VAE encode & Code & High & $O(T)$ fewer VAE passes \\
+Cached prompt/image emb & Code & High & Fewer CLIP passes \\
+Clone audit & Code & Medium & Lower peak memory \\
+Video save batching + smoothing & Code & Medium & Faster save, optional smoothing \\
+\midrule
+\multicolumn{4}{l}{\textit{Low-memory GPUs (e.g.\ P100, 16\,GB):}} \\
+Low-memory / device-tier config & Memory & High & Enables P100/T4 presets \\
+FP16 / FP8 / FP4 precision choice & Memory & High & FP8 or FP4 when FP16 OOMs; lower VRAM, small (FP8) to moderate (FP4) quality trade-off \\
+FP16 + optional tiled decode & Memory & High & Fits 16\,GB; minimal quality loss \\
+Smaller equirect \& view size & Memory & Medium & Lower peak VRAM \\
+More VAE tiles, smaller tiles & Memory & Medium & Bounded encode/decode memory \\
+Temporal chunking, smaller \fn{loop\_step\_frame} & Memory & Medium & Per-pass memory within limit \\
+Fewer steps + quad/LCM schedule & Compute & Medium & Same perceived quality, fewer steps \\
+\fn{empty\_cache} / offload between stages & Memory & Medium & One-stage peak at a time \\
+\bottomrule
+\end{tabular}
+\caption{Summary of improvements by category.}
+\end{table}
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+
+This plan covers \textbf{image quality}, \textbf{dynamic degree}, \textbf{motion smoothness}, \textbf{temporal flickering}, \textbf{scene} and \textbf{scene richness}, \textbf{Q-Align (I/V)}, \textbf{CLIP Score}, \textbf{graphics quality}, \textbf{frame consistency}, \textbf{motion pattern}, and \textbf{low-GPU operation} through:
+
+\begin{enumerate}
+    \item \textbf{Mathematics}: Grid centering, longitude normalization, nearest-neighbor rounding, bilinear splat vectorization and blending, DDIM-aware re-noising, latitude-adaptive sampling, multi-view score averaging.
+    \item \textbf{Logic}: Smooth overlap and merge-decay schedules, temporal CFG in the sphere pipeline, temporal guidance schedule, dynamic CFG, Gaussian tiled VAE blending, unified preprocessing.
+    \item \textbf{Code}: Cached VAE encoding, cached text/image embeddings, clone audit, batched video decode/save, optional post-decode temporal smoothing.
+    \item \textbf{Optional metrics}: Q-Align (I)/(V) and CLIP Score modules for monitoring and selection.
+    \item \textbf{Low-memory GPUs}: Section~14 describes running on limited VRAM (e.g.\ P100, 16\,GB) with minimal quality loss: device-tier config, FP16, smaller resolution and view size, more/smaller VAE tiles, tiled VAE decode, temporal chunking, fewer DDIM steps with quad/LCM schedule, and \fn{empty\_cache}/offload between stages.
+\end{enumerate}
+
+Implementing these changes will improve visual quality, temporal stability, and inference efficiency without requiring changes to the core diffusion architecture, and will allow the pipeline to run on lower-end GPUs like the P100 without sacrificing more quality than necessary.
+
+\end{document}

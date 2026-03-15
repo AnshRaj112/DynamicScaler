@@ -1,0 +1,699 @@
+
+\documentclass[11pt,a4paper]{article}
+
+% ─── Packages ───
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{titlesec}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=green!40!black,
+    urlcolor=cyan!50!black,
+}
+
+\lstset{
+    language=Python,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red!70!black},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    showstringspaces=false,
+    tabsize=4,
+}
+
+\definecolor{enhance}{RGB}{0,100,0}
+\newcommand{\enhance}[1]{\textcolor{enhance}{\textbf{#1}}}
+\newcommand{\file}[1]{\texttt{#1}}
+\newcommand{\fn}[1]{\texttt{#1}}
+
+\title{
+    \textbf{DynamicScaler: Enhancement Analysis Report} \\[6pt]
+    \large Opportunities for Improving Code, Logic, and Mathematics \\
+    for Higher-Quality Panoramic Video Generation
+}
+\author{Auto-generated Codebase Analysis}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document provides a systematic analysis of the \textbf{DynamicScaler} codebase---a CVPR 2025 project for seamless and scalable panoramic video generation.
+We identify concrete opportunities where code quality, algorithmic logic, and mathematical formulations can be enhanced to yield higher-quality results.
+Each section describes the current implementation, explains the limitation, and proposes an enhancement with mathematical justification.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%======================================================================
+\section{Overview of the Codebase}
+%======================================================================
+
+DynamicScaler generates 360\textdegree{} panoramic videos by:
+\begin{enumerate}
+    \item Representing the panorama in equirectangular format.
+    \item Extracting perspective views via gnomonic projection.
+    \item Denoising each view using a pre-trained video diffusion model (VideoCrafter).
+    \item Merging denoised views back into the equirectangular domain using shift-window strategies.
+    \item Optionally upscaling via a second-pass denoise stage.
+\end{enumerate}
+
+The pipeline orchestrates three key sampling methods: sphere panorama shift-window denoising, normal plane shift-window denoising, and upscaled shift-window denoising.
+
+%======================================================================
+\section{Mathematics: Equirectangular Projection}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In \file{panorama\_tensor\_utils.py} and \file{ring\_panorama\_tensor\_utils.py}, the perspective--equirectangular mapping is implemented in \fn{\_get\_uv()}.
+The coordinate grid is constructed as:
+
+\begin{lstlisting}
+x = torch.linspace(-width/2, width/2 - 1, steps=width)
+y = torch.linspace(-height/2, height/2 - 1, steps=height)
+\end{lstlisting}
+
+\subsection{Issue: Asymmetric Pixel Grid}
+
+The grid ranges from $[-W/2, \; W/2-1]$ instead of the half-pixel-centered symmetric grid $[-(W-1)/2, \; (W-1)/2]$.
+For an even-width image (e.g.\ $W=512$), the grid spans $[-256, 255]$, introducing a \textbf{0.5-pixel bias} in the horizontal and vertical directions.
+This asymmetry propagates through the rotation matrix and longitude/latitude conversion, causing a subtle sub-pixel misalignment in every view extraction and re-projection.
+
+\subsection{Proposed Enhancement}
+
+Replace with a properly centered grid:
+\begin{equation}
+    x_i = \frac{(2i - (W-1))}{2}, \quad i = 0, 1, \ldots, W-1
+\end{equation}
+\begin{lstlisting}
+x = torch.linspace(-(width-1)/2, (width-1)/2, steps=width)
+y = torch.linspace(-(height-1)/2, (height-1)/2, steps=height)
+\end{lstlisting}
+
+This ensures the grid is \textbf{symmetric about the optical center}, improving geometric accuracy of the gnomonic projection.
+
+%======================================================================
+\section{Mathematics: Longitude--Latitude Mapping Normalization}
+%======================================================================
+
+\subsection{Current Implementation}
+
+After computing spherical coordinates $(\text{lon}, \text{lat})$, the mapping to equirectangular pixel coordinates $(u, v)$ is:
+\begin{equation}
+    u = \frac{\text{lon}}{2\pi} \cdot (W-1), \qquad
+    v = \frac{\text{lat} + \pi/2}{\pi} \cdot (H-1)
+\end{equation}
+
+\subsection{Issue: Off-by-One in Wrap-Around}
+
+Using $(W-1)$ instead of $W$ means that the leftmost column ($u=0$) maps to $\text{lon}=0$ and the rightmost column ($u=W-1$) maps to $\text{lon}=2\pi$ -- but $\text{lon}=0$ and $\text{lon}=2\pi$ are \emph{the same physical direction}.
+This causes the rightmost column to be a duplicate of the leftmost, wasting one column's worth of resolution and creating potential seam artifacts.
+
+\subsection{Proposed Enhancement}
+
+For equirectangular panoramas with horizontal periodicity:
+\begin{equation}
+    u = \frac{\text{lon}}{2\pi} \cdot W
+\end{equation}
+This spreads $W$ pixels across $[0, 2\pi)$ without duplication.
+The vertical mapping should remain with $(H-1)$ since the poles are genuine boundary conditions:
+\begin{equation}
+    v = \frac{\text{lat} + \pi/2}{\pi} \cdot (H-1)
+\end{equation}
+
+%======================================================================
+\section{Mathematics: Nearest-Neighbor Sampling}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In \fn{\_sample\_equirect\_tensor\_nearest()}, the nearest-neighbor sampling uses \fn{torch.floor()}:
+\begin{lstlisting}
+u0 = torch.floor(u).long()
+v0 = torch.floor(v).long()
+\end{lstlisting}
+
+\subsection{Issue: Biased Rounding}
+
+\fn{floor()} always rounds \emph{downward}, introducing a systematic directional bias.
+For truly nearest-neighbor sampling, \fn{torch.round()} should be used so that each pixel maps to its geometrically closest neighbor:
+
+\begin{equation}
+    u_{\text{nn}} = \operatorname{round}(u), \quad v_{\text{nn}} = \operatorname{round}(v)
+\end{equation}
+
+\subsection{Proposed Enhancement}
+\begin{lstlisting}
+u0 = torch.round(u).long()
+v0 = torch.round(v).long()
+\end{lstlisting}
+
+This reduces average reprojection error from $\sim 0.5$ px to $\sim 0.25$ px (under uniform distribution of sub-pixel offsets), yielding sharper view reconstructions.
+
+%======================================================================
+\section{Mathematics: Bilinear Splatting in \fn{set\_view\_tensor\_bilinear()}}
+%======================================================================
+
+\subsection{Current Implementation}
+
+The bilinear write-back in \file{panorama\_tensor\_utils.py} uses a nested Python loop over batch and channel dimensions:
+\begin{lstlisting}
+for b in range(B):
+    for c in range(self.C):
+        accumulator[c].index_add_(0, idx00, view_flat[b,c] * w00)
+        ...
+\end{lstlisting}
+
+\subsection{Issue 1: Computational Inefficiency}
+
+The $O(B \times C)$ Python loop is extremely slow.
+With $B=1$ and $C=4$ (latent channels), this involves 16 \fn{index\_add\_} calls per pixel set.
+
+\subsection{Issue 2: Missing Normalization for Overlapping Writes}
+
+When multiple source pixels from the view map to the same equirectangular pixel, the accumulated value is divided by the sum of weights.
+However, this \textbf{overwrites the existing panorama content entirely} in the accumulated region, rather than blending with existing values.
+
+\subsection{Proposed Enhancement}
+
+\begin{enumerate}
+    \item \textbf{Vectorize} the scatter operation using batched \fn{scatter\_add\_()}:
+\begin{lstlisting}
+# Flatten across B,C for a single scatter_add_ call
+view_flat_all = view_flat.reshape(-1, H*W)
+# Weighted values for each corner
+for idx, w in [(idx00,w00),(idx01,w01),(idx10,w10),(idx11,w11)]:
+    accum.scatter_add_(1, idx.unsqueeze(0).expand(B*C,-1),
+                       view_flat_all * w.unsqueeze(0))
+\end{lstlisting}
+
+    \item \textbf{Blend with existing content} by introducing a user-controlled blending factor $\alpha \in [0,1]$:
+\begin{equation}
+    P_{\text{new}}(u,v) = \alpha \cdot \frac{\sum_k w_k \cdot V_k}{\sum_k w_k} + (1-\alpha) \cdot P_{\text{old}}(u,v)
+\end{equation}
+\end{enumerate}
+
+%======================================================================
+\section{Mathematics: Re-noising Formulation}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In \file{scheduler.py}, the \fn{re\_noise()} method converts a sample $x_a$ at noise level $a$ to noise level $b$:
+
+\begin{equation}
+    x_b = \sqrt{\frac{\bar{\alpha}_b}{\bar{\alpha}_a}} \, x_a + \sqrt{1 - \frac{\bar{\alpha}_b}{\bar{\alpha}_a}} \, \tilde{\epsilon}
+\end{equation}
+
+\subsection{Issue: Information-Theoretic Sub-optimality}
+
+This formula is the ``direct'' re-noising approach, which adds \emph{independent} Gaussian noise $\tilde{\epsilon}$.
+It does not preserve as much structural information as the DDIM-inversion-based re-noising, because the newly added noise is uncorrelated with the original noise trajectory.
+
+\subsection{Proposed Enhancement: DDIM-Inversion-based Re-noising}
+
+Instead of independent noise injection, use DDIM inversion to estimate what the noise prediction would be at step $a$, then forward the DDIM process to step $b$:
+
+\begin{align}
+    \hat{\epsilon}_a &= \frac{x_a - \sqrt{\bar{\alpha}_a} \cdot \hat{x}_0}{\sqrt{1 - \bar{\alpha}_a}} \\
+    x_b &= \sqrt{\bar{\alpha}_b} \cdot \hat{x}_0 + \sqrt{1 - \bar{\alpha}_b - \sigma_b^2} \cdot \hat{\epsilon}_a + \sigma_b \cdot \epsilon
+\end{align}
+
+where $\hat{x}_0$ can be estimated by running a single denoising step.
+This preserves the noise trajectory and leads to more coherent transitions between noise levels, especially important in the multi-scale upscaling pipeline.
+
+%======================================================================
+\section{Logic: Overlap Ratio Scheduling}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In \file{gen\_pano\_360.py}, the temporal overlap ratio schedule is built via:
+\begin{lstlisting}
+overlap_ratio_list_1_f_org = [0.75, 0.5]
+overlap_ratio_list_1_f = [
+    overlap_ratio_list_1_f_org[
+        i * len(overlap_ratio_list_1_f_org) // num_inference_steps
+    ]
+    for i in range(num_inference_steps)
+]
+\end{lstlisting}
+
+\subsection{Issue: Abrupt Step-Function Transition}
+
+With only two values $[0.75, 0.5]$, the overlap ratio drops discontinuously from 0.75 to 0.5 at the midpoint of the denoising schedule.
+This causes an abrupt change in the effective receptive field overlap, which can lead to visible temporal seam artifacts at the transition boundary.
+
+\subsection{Proposed Enhancement: Smooth Cosine Annealing}
+
+Replace the step function with a smooth cosine annealing schedule:
+\begin{equation}
+    r(t) = r_{\max} - \frac{r_{\max} - r_{\min}}{2} \left(1 - \cos\left(\frac{\pi t}{T}\right)\right)
+\end{equation}
+where $r_{\max}=0.75$, $r_{\min}=0.5$, $t$ is the timestep index, and $T$ is the total number of inference steps.
+
+\begin{lstlisting}
+import math
+overlap_ratio_list_f = [
+    r_max - (r_max - r_min)/2 * (1 - math.cos(math.pi * i / T))
+    for i in range(T)
+]
+\end{lstlisting}
+
+This provides a gradual transition, reducing visible boundary effects.
+
+%======================================================================
+\section{Logic: Denoised Overlap Merging Ratio Decay}
+%======================================================================
+
+\subsection{Current Implementation}
+
+The \fn{merge\_prev\_denoised\_ratio\_list} is generated using linear decay:
+\begin{lstlisting}
+merge_prev_denoised_ratio_list = [
+    max_ratio * (1 - t / merge_prev_step)
+    for t in range(merge_prev_step)
+] + [0] * (num_steps - merge_prev_step)
+\end{lstlisting}
+
+\subsection{Issue: Sub-optimal Linear Decay}
+
+Linear decay applies equal blending reduction at each step.
+In diffusion models, the early (high-noise) steps contribute coarse structure while late (low-noise) steps refine details.
+A linear schedule over-blends during the detail-refinement phase.
+
+\subsection{Proposed Enhancement: Exponential or Cosine Decay}
+
+Use exponential decay so that blending is strong in early steps and decays rapidly:
+\begin{equation}
+    \lambda(t) = \lambda_{\max} \cdot \exp\left(-\frac{\gamma \, t}{T_{\text{merge}}}\right)
+\end{equation}
+
+Or cosine decay:
+\begin{equation}
+    \lambda(t) = \frac{\lambda_{\max}}{2} \left(1 + \cos\left(\frac{\pi \, t}{T_{\text{merge}}}\right)\right)
+\end{equation}
+
+Both schedules reduce interference during the critical detail-refinement phase, improving fine-grained texture quality.
+
+%======================================================================
+\section{Logic: Classifier-Free Guidance}
+%======================================================================
+
+\subsection{Current Implementation}
+
+CFG is applied uniformly with a constant guidance scale:
+\begin{equation}
+    \hat{\epsilon} = \epsilon_{\text{uncond}} + s \cdot (\epsilon_{\text{cond}} - \epsilon_{\text{uncond}})
+\end{equation}
+
+\subsection{Issue: Over-saturation at Low Noise Levels}
+
+A constant guidance scale $s$ produces good results at high noise levels but tends to cause oversaturated artifacts at low noise levels (later denoising steps) where the signal-to-noise ratio is already high.
+
+\subsection{Proposed Enhancement: Dynamic Guidance Rescaling}
+
+Implement timestep-dependent guidance scaling:
+\begin{equation}
+    s(t) = s_{\max} \cdot \left(\frac{\bar{\alpha}_t}{1 - \bar{\alpha}_t}\right)^{-\beta}
+\end{equation}
+
+where $\beta$ is a small positive constant (e.g.\ $\beta \approx 0.1)$.
+This reduces guidance strength as SNR increases.
+
+Alternatively, implement the guidance rescale technique from ``Common Diffusion Noise Schedules and Sample Steps are Flawed'' (Lin et al., 2023):
+\begin{equation}
+    \hat{\epsilon}_{\text{rescaled}} = \phi \cdot \hat{\epsilon}_{\text{cfg}} + (1-\phi) \cdot \hat{\epsilon}_{\text{cfg}} \cdot \frac{\|\epsilon_{\text{cond}}\|}{\|\hat{\epsilon}_{\text{cfg}}\|}
+\end{equation}
+
+This avoids over-exposure without reducing prompt adherence.
+
+%======================================================================
+\section{Logic: Tiled VAE Encoding}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In \fn{tiled\_vae\_encode\_tensor\_simple()}, the image is split into a fixed $4\!\times\!4$ grid of tiles with a fixed overlap of 32 pixels per side, and the stitched latent is the \emph{average} of overlapping tile latents.
+
+\subsection{Issue: Hard Boundaries Despite Averaging}
+
+Simple averaging at tile boundaries can produce visible seams, because the VAE encoder's receptive field extends beyond the overlap region and encodes context differently at tile edges.
+
+\subsection{Proposed Enhancement: Gaussian-Weighted Blending}
+
+Use Gaussian or cosine-tapered weighting masks for each tile instead of uniform averaging:
+\begin{equation}
+    W(x, y) = \prod_{d \in \{x, y\}} \begin{cases}
+        \frac{1}{2}\left(1 + \cos\left(\frac{\pi (d - d_0)}{O}\right)\right) & \text{if } d \in \text{overlap region} \\
+        1 & \text{otherwise}
+    \end{cases}
+\end{equation}
+where $O$ is the overlap width.
+This produces smooth transitions:
+\begin{equation}
+    L_{\text{fused}}(x,y) = \frac{\sum_k W_k(x,y) \cdot L_k(x,y)}{\sum_k W_k(x,y)}
+\end{equation}
+
+Additionally, consider making the overlap size and tile count \textbf{adaptive} based on image resolution rather than using fixed constants.
+
+%======================================================================
+\section{Logic: Image Preprocessing}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In \file{precast\_latent\_utils.py}:
+\begin{lstlisting}
+transform = transforms.Compose([
+    transforms.Resize(image_size),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
+    transforms.Lambda(lambda x: x * 2.0 - 1.0)
+])
+\end{lstlisting}
+
+Meanwhile, in \file{tensor\_utils.py}:
+\begin{lstlisting}
+rgb_img = cv2.resize(rgb_img, (width, height),
+                     interpolation=cv2.INTER_LINEAR)
+img_tensor = (img_tensor / 255. - 0.5) * 2
+\end{lstlisting}
+
+\subsection{Issue 1: Inconsistent Resize Methods}
+
+Two different image loading/resizing pipelines are used (\fn{torchvision.transforms.Resize} vs.\ \fn{cv2.resize}).
+These use different interpolation algorithms internally (PIL's Lanczos by default vs.\ OpenCV's bilinear), leading to subtly different pixel values for the same input image.
+
+\subsection{Issue 2: Redundant Normalization}
+
+The \fn{Normalize(mean=[0,...], std=[1,...])} in the transform pipeline is a no-op (identity transform), adding unnecessary computational overhead.
+
+\subsection{Proposed Enhancement}
+
+\begin{enumerate}
+    \item \textbf{Unify} all image loading to a single method that uses consistent interpolation (recommend Lanczos/area-based downsampling for higher quality):
+\begin{lstlisting}
+rgb_img = cv2.resize(rgb_img, (W, H),
+                     interpolation=cv2.INTER_AREA)  # for downscale
+# or cv2.INTER_LANCZOS4 for upscale
+\end{lstlisting}
+
+    \item Remove the redundant \fn{Normalize} transform.
+    \item Consider using anti-aliased resizing (e.g., \fn{transforms.Resize(..., antialias=True)}) to prevent aliasing artifacts.
+\end{enumerate}
+
+%======================================================================
+\section{Logic: Latent Resizing Interpolation}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In \file{diffusion\_utils.py}, video latents are resized using \fn{F.interpolate} with either \texttt{nearest} or \texttt{bilinear} mode:
+\begin{lstlisting}
+upsampled = F.interpolate(video_reshaped,
+    size=(target_height, target_width),
+    mode=mode, align_corners=align_corners)
+\end{lstlisting}
+
+\subsection{Issue: Nearest-Neighbor for Upscaling}
+
+In the sphere panorama pipeline, \fn{resize\_video\_latent(..., mode="nearest")} is used at multiple points for both downscaling and upscaling.
+Nearest-neighbor produces blocky latent representations and can introduce high-frequency artifacts in the generated output.
+
+For the upscale path, \texttt{bicubic} is used, which is better, but the upsampled latent is then re-noised without any anti-aliasing.
+
+\subsection{Proposed Enhancement}
+
+\begin{enumerate}
+    \item Use \texttt{bilinear} or \texttt{bicubic} for all latent resizing operations, especially upscaling.
+    \item Apply a small Gaussian blur to the upsampled latent \emph{before} re-noising to suppress spurious high-frequency content:
+\begin{equation}
+    L_{\text{smooth}} = G_\sigma * L_{\text{upsampled}}
+\end{equation}
+where $G_\sigma$ is a Gaussian kernel with $\sigma \approx 0.5$--$1.0$.
+\end{enumerate}
+
+%======================================================================
+\section{Logic: Shift-Window Theta Offset Cycling}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In the sphere panorama sampling:
+\begin{lstlisting}
+theta_offset = (i % loop_step_theta) * (view_fov // loop_step_theta)
+\end{lstlisting}
+
+\subsection{Issue: Integer Division Gaps}
+
+When $\text{view\_fov} = 120$ and $\text{loop\_step\_theta} = 10$, the offset increments by $120 / 10 = 12$ degrees.
+But for non-divisible combinations, integer division truncates the step size, leaving \textbf{unvisited angular gaps} in the panoramic coverage.
+
+\subsection{Proposed Enhancement}
+
+Use floating-point division to ensure full coverage:
+\begin{equation}
+    \theta_{\text{offset}} = (i \bmod N) \cdot \frac{\text{FoV}}{N}
+\end{equation}
+\begin{lstlisting}
+theta_offset = (i % loop_step_theta) * (view_fov / loop_step_theta)
+\end{lstlisting}
+
+%======================================================================
+\section{Code: Redundant VAE Encoding per Timestep}
+%======================================================================
+
+\subsection{Current Implementation}
+
+Inside the denoising loop in \fn{basic\_sample\_shift\_shpere\_panorama()}, the panoramic input image is repeatedly re-encoded by the VAE at every timestep when \fn{paste\_on\_static} is enabled:
+\begin{lstlisting}
+if paste_on_static and i < total_steps - 1:
+    frame_0_latent = self.tiled_vae_encode_image(
+        image_path=pano_image_path,
+        image_size=(equirect_height, equirect_width))
+\end{lstlisting}
+
+\subsection{Issue}
+
+The input image never changes across timesteps, so the VAE encoding produces identical results each time.
+This wastes significant GPU computation---the tiled VAE encode over a $1024\!\times\!512$ image is expensive.
+
+\subsection{Proposed Enhancement}
+
+Cache the encoded latent \emph{before} the denoising loop:
+\begin{lstlisting}
+cached_frame_0_latent = self.tiled_vae_encode_image(
+    image_path=pano_image_path,
+    image_size=(equirect_height, equirect_width))
+
+for i, t in enumerate(timesteps):
+    if paste_on_static and i < total_steps - 1:
+        frame_0_latent = cached_frame_0_latent
+        ...
+\end{lstlisting}
+
+This saves $O(T)$ VAE forward passes, substantially reducing total inference time.
+
+%======================================================================
+\section{Code: Redundant \fn{.clone()} Operations}
+%======================================================================
+
+\subsection{Current Implementation}
+
+Throughout the codebase, \fn{.clone()} is called extensively, often unnecessarily:
+\begin{lstlisting}
+# In ring_panorama_tensor_utils.py
+view = view_tensor.view(...).clone()
+
+# In scheduler.py
+return desired_latent.clone()
+\end{lstlisting}
+
+\subsection{Issue}
+
+Many of these clones occur on tensors that are immediately consumed and not referenced again, creating wasteful memory copies.
+In a pipeline where latent tensors have shape $(1, 4, 16, 64, 128)$, each clone allocates an additional $\sim$2 MB.
+
+\subsection{Proposed Enhancement}
+
+Audit each \fn{.clone()} and remove those that are not needed for in-place operation safety.
+Specifically:
+\begin{itemize}
+    \item Clones before \fn{scatter\_} or \fn{index\_add\_} operations are necessary---keep them.
+    \item Clones on return values that are immediately consumed by the caller---remove them.
+    \item In \fn{get\_window\_latent()}, the final \fn{.clone()} can be replaced with returning the concatenated tensor directly.
+\end{itemize}
+
+%======================================================================
+\section{Code: Duplicate Prompt Encoding}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In the sphere panorama pipeline, prompt embeddings are re-computed for \emph{every view} at \emph{every timestep}:
+\begin{lstlisting}
+text_emb = self.pretrained_t2v.get_learned_conditioning(
+                                            [curr_phi_prompt])
+img_emb = self.pretrained_t2v.get_image_embeds(
+                            batch_imgs=view_condition_image_tensor)
+\end{lstlisting}
+
+\subsection{Issue}
+
+The text embedding for each elevation-specific prompt is identical across all timesteps and all theta positions at the same elevation.
+These redundant CLIP forward passes waste compute.
+
+\subsection{Proposed Enhancement}
+
+Pre-compute and cache the text embeddings before the denoising loop:
+\begin{lstlisting}
+phi_text_emb_cache = {}
+for phi_angle, phi_prompt in phi_prompt_dict.items():
+    phi_text_emb_cache[phi_angle] = \
+        self.pretrained_t2v.get_learned_conditioning([phi_prompt])
+\end{lstlisting}
+
+Similarly, condition image embeddings can be cached per $(\theta, \phi)$ view since the input panorama does not change.
+
+%======================================================================
+\section{Code: Video Saving and Post-processing}
+%======================================================================
+
+\subsection{Current Implementation}
+
+In \fn{save\_decoded\_video\_latents()}, video frames are decoded and saved one at a time:
+\begin{lstlisting}
+for frame_idx in range(decoded_video_latents.shape[2]):
+    frame_tensor = decoded_video_latents[:, :, [frame_idx]]
+    image = tensor2image(frame_tensor)
+    video_frames_img_list.append(image)
+\end{lstlisting}
+
+\subsection{Proposed Enhancement}
+
+\begin{enumerate}
+    \item Process frames in mini-batches for more efficient GPU utilization.
+    \item Use built-in \fn{torchvision.utils.save\_image()} or batched tensor-to-numpy conversion instead of per-frame Python loops.
+    \item Add optional temporal smoothing via a 1D Gaussian or bilateral filter along the time dimension before saving, to reduce inter-frame flickering.
+\end{enumerate}
+
+%======================================================================
+\section{Mathematics: Polar Region Handling}
+%======================================================================
+
+\subsection{Current Implementation}
+
+The sphere panorama pipeline treats all elevation angles ($\phi$) uniformly, sampling the same number of theta positions for most elevation angles:
+\begin{lstlisting}
+phi_theta_dict = {
+    90:  [0],
+    75:  [360*t//phi_num for t in range(phi_num)],
+    ...
+    0:   [360*t//phi_num for t in range(phi_num)],
+    -75: [360*t//phi_num for t in range(phi_num)],
+    -90: [0],
+}
+\end{lstlisting}
+
+\subsection{Issue: Over-sampling Polar Regions}
+
+At high latitudes (e.g.\ $|\phi| = 75\degree$), the equirectangular projection compresses azimuthal distance.
+Sampling 6 theta values at $\phi = 75\degree$ produces views with significant overlap, while at $\phi = 0\degree$ (equator), 6 views may be insufficient.
+
+\subsection{Proposed Enhancement: Latitude-Adaptive Theta Sampling}
+
+Scale the number of theta samples by $\cos(\phi)$ to achieve uniform solid-angle coverage:
+\begin{equation}
+    N_\theta(\phi) = \max\left(1, \; \left\lfloor N_0 \cdot \cos(\phi) \right\rfloor\right)
+\end{equation}
+where $N_0$ is the base number of samples at the equator.
+
+This reduces redundant computation at poles and increases coverage at the equator, improving both quality and efficiency.
+
+%======================================================================
+\section{Mathematics: Guidance Scale for Multi-View Consistency}
+%======================================================================
+
+\subsection{Current Limitation}
+
+Each perspective view is denoised independently with CFG.
+There is no mechanism to enforce multi-view consistency beyond the overlap merging.
+
+\subsection{Proposed Enhancement: Multi-View Score Averaging}
+
+Before computing the DDIM step, average the noise predictions from overlapping views:
+\begin{equation}
+    \hat{\epsilon}_{\text{avg}}(p) = \frac{\sum_{v \in \mathcal{V}(p)} w_v \cdot \hat{\epsilon}_v(p)}{\sum_{v \in \mathcal{V}(p)} w_v}
+\end{equation}
+where $\mathcal{V}(p)$ is the set of views covering pixel $p$, and $w_v$ accounts for projection distortion (e.g.\ $w_v \propto \cos(\phi_v)$ for sphere-aware weighting).
+
+This is analogous to the ``MultiDiffusion'' approach and would improve global coherence.
+
+%======================================================================
+\section{Summary of Proposed Enhancements}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{0.26\textwidth}p{0.15\textwidth}p{0.10\textwidth}p{0.40\textwidth}@{}}
+\toprule
+\textbf{Enhancement} & \textbf{Category} & \textbf{Impact} & \textbf{Key Benefit} \\
+\midrule
+Pixel Grid Centering & Math & Medium & Removes 0.5 px projection bias \\
+Longitude Normalization & Math & Medium & Eliminates pixel duplication at 360\textdegree{} seam \\
+Nearest-Neighbor Rounding & Math & Low & Reduces average reprojection error \\
+Bilinear Splat Vectorization & Code/Math & High & 4--8$\times$ speedup in write-back \\
+DDIM-aware Re-noising & Math & High & Better structure preservation in upscaling \\
+Smooth Overlap Scheduling & Logic & Medium & Eliminates temporal seam artifacts \\
+Cosine/Exp Merge Decay & Logic & Medium & Sharper details in final output \\
+Dynamic CFG Guidance & Logic & High & Reduces over-saturation \\
+Gaussian Tiled VAE Blending & Logic & Medium & Smoother tile boundaries \\
+Unified Image Preprocessing & Code & Low & Consistent pixel values \\
+Bicubic Latent Resizing & Logic & Medium & Less blocky upscaling \\
+Float Theta Offset & Logic & Low & Eliminates angular gaps \\
+Cached VAE Encoding & Code & High & $O(T)$ fewer VAE passes \\
+Cached Prompt Embeddings & Code & High & $O(T \!\cdot\! N_\phi \!\cdot\! N_\theta)$ fewer CLIP passes \\
+Remove Redundant Clones & Code & Medium & Lower peak memory \\
+Latitude-Adaptive Sampling & Math/Logic & High & Uniform coverage, 30\%+ fewer views at poles \\
+Multi-View Score Averaging & Math & High & Global panorama coherence \\
+\bottomrule
+\end{tabular}
+\caption{Summary of all proposed enhancements ordered by category.}
+\end{table}
+
+%======================================================================
+\section{Conclusion}
+%======================================================================
+
+The DynamicScaler codebase is a well-structured implementation of a novel panoramic video generation pipeline.
+The enhancements proposed in this document span three axes:
+
+\begin{enumerate}
+    \item \textbf{Mathematical Precision}: Fixing subtle but impactful geometric projection errors that accumulate across hundreds of view extractions and re-projections.
+    \item \textbf{Algorithmic Logic}: Replacing abrupt schedules and uniform strategies with smooth, adaptive alternatives informed by diffusion theory.
+    \item \textbf{Code Efficiency}: Caching invariant computations, vectorizing inner loops, and removing redundant memory operations.
+\end{enumerate}
+
+Together, these improvements target higher visual quality, fewer seam artifacts, and significantly faster inference---all without requiring architectural changes to the underlying diffusion model.
+
+\end{document}

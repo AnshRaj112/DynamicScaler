@@ -1,15 +1,18 @@
 
 import json
+import math
 from datetime import datetime
 import os
 import shutil
-
-
 import argparse
 from dataclasses import dataclass, field
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
+
+# Set to True to skip 2x upscale stage and avoid VRAM OOM on 16GB GPUs (e.g. Tesla P100).
+# The 2x decode path allocates ~5GB+ during VAE decode; set to False only when you have enough VRAM.
+SKIP_2X_UPSCALE_TO_AVOID_OOM = True
 
 
 @dataclass
@@ -66,6 +69,8 @@ class VArgs:
     merge_denoised = True
     max_merge_denoised_overlap_latent_ratio = 0.5 
     _merge_prev_step = 20
+    temporal_guidance_scale: Optional[float] = None  # set to e.g. 0.5 for temporal CFG in sphere pipeline
+    low_memory: bool = False  # empty_cache between stages for P100/16GB
 
 
     @classmethod
@@ -158,6 +163,7 @@ def main(run_args: RunArgs, prompt, image_path, image_folder,
          overlap_ratio_list_2_f=None,
          upscale_factor=None,
          merge_prev_denoised_ratio_list=None,
+         temporal_guidance_scale=None,
          project_name="",
          project_folder=None):
 
@@ -261,6 +267,7 @@ def main(run_args: RunArgs, prompt, image_path, image_folder,
 
             denoise_to_step=denoise_to_step,
             merge_prev_denoised_ratio_list=merge_prev_denoised_ratio_list,
+            temporal_guidance_scale=temporal_guidance_scale,
 
             downsample_factor_before_vae_decode=downsample_factor_before_vae_decode,
             latents=None,
@@ -274,6 +281,9 @@ def main(run_args: RunArgs, prompt, image_path, image_folder,
         if save_latents:
             torch.save(sphere_SW_latent, os.path.join(output_dir, "sphere_SW_latent.pt"))
             # torch.save(basic_SW_video_frames, os.path.join(output_dir, "basic_SW_video_frames.pt"))
+        if getattr(vargs, 'low_memory', False):
+            torch.cuda.empty_cache()
+            gc.collect()
     else:
         print(f"loading SW latent from {vargs.predenoised_SP_latent_path}")
         sphere_SW_latent = torch.load(vargs.predenoised_SP_latent_path)
@@ -284,7 +294,7 @@ def main(run_args: RunArgs, prompt, image_path, image_folder,
 
         if vargs.predenoised_SW_1x_latent_path is None:
 
-            downsampled_sphere_SW_latent = resize_video_latent(input_latent=sphere_SW_latent.clone(), mode="nearest",
+            downsampled_sphere_SW_latent = resize_video_latent(input_latent=sphere_SW_latent.clone(), mode="bilinear",
                                                                target_height=int(equirect_height // downsample_factor_before_vae_decode // 8),
                                                                target_width=int(equirect_width // downsample_factor_before_vae_decode // 8))
 
@@ -330,12 +340,15 @@ def main(run_args: RunArgs, prompt, image_path, image_folder,
                                        output_path=output_dir,
                                        output_name="shift_windows",
                                        fps=run_args.fps)
+            if getattr(vargs, 'low_memory', False):
+                torch.cuda.empty_cache()
+                gc.collect()
         else:
             print(f"loading basic_SW_latent from : {vargs.predenoised_SW_1x_latent_path}")
             basic_SW_latent = torch.load(vargs.predenoised_SW_1x_latent_path)
 
 
-    if vargs.do_upscale:
+    if vargs.do_upscale and not SKIP_2X_UPSCALE_TO_AVOID_OOM:
         print("==== Upscale Shift Windows Sample ====")
 
         if vargs.skip_1x:
@@ -393,6 +406,8 @@ def main(run_args: RunArgs, prompt, image_path, image_folder,
                                    output_path=output_dir,
                                    output_name=f"SW_2X_{project_name}",
                                    fps=run_args.fps)
+    elif vargs.do_upscale and SKIP_2X_UPSCALE_TO_AVOID_OOM:
+        print("==== 2x upscale skipped (SKIP_2X_UPSCALE_TO_AVOID_OOM=True) to avoid VRAM OOM on 16GB GPUs ====")
 
 
 
@@ -441,17 +456,22 @@ if __name__ == "__main__":
 
     phi_num = vargs.phi_num
 
+    # Latitude-adaptive theta count: N_theta(phi) = max(1, floor(N_0 * cos(phi * pi/180))) for uniform solid-angle coverage
+    def n_theta_for_phi(phi_deg, n0):
+        import math
+        n = max(1, int(n0 * math.cos(phi_deg * math.pi / 180.0)))
+        return max(1, n)
+
     phi_theta_dict = {
         90:  [0],
         -90: [0],
-
-        75:     [360*t//phi_num for t in range(phi_num)],
-        -75:    [360*t//phi_num for t in range(phi_num)],
-        60:     [360*t//phi_num for t in range(phi_num)],
-        -60:    [360*t//phi_num for t in range(phi_num)],
-        45:     [360*t//phi_num for t in range(phi_num)],
-        -45:    [360*t//phi_num for t in range(phi_num)],
-        0:      [360*t//phi_num for t in range(phi_num)],
+        75:  [360 * t // n_theta_for_phi(75, phi_num) for t in range(n_theta_for_phi(75, phi_num))],
+        -75: [360 * t // n_theta_for_phi(-75, phi_num) for t in range(n_theta_for_phi(-75, phi_num))],
+        60:  [360 * t // n_theta_for_phi(60, phi_num) for t in range(n_theta_for_phi(60, phi_num))],
+        -60: [360 * t // n_theta_for_phi(-60, phi_num) for t in range(n_theta_for_phi(-60, phi_num))],
+        45:  [360 * t // n_theta_for_phi(45, phi_num) for t in range(n_theta_for_phi(45, phi_num))],
+        -45: [360 * t // n_theta_for_phi(-45, phi_num) for t in range(n_theta_for_phi(-45, phi_num))],
+        0:   [360 * t // phi_num for t in range(phi_num)],  # equator: full N0
     }
 
     if phi_0_first:
@@ -474,20 +494,29 @@ if __name__ == "__main__":
     dock_at_f = vargs.dock_at_f
     loop_step_frame = vargs.loop_step_frame
 
-    overlap_ratio_list_1_f_org = [0.75, 0.5]
+    # Smooth cosine annealing for overlap ratio (reduces temporal seam/flicker at transition)
+    # r(t) = r_max - (r_max - r_min)/2 * (1 - cos(pi*t/T)); r_max=0.75, r_min=0.5
+    r_max, r_min = 0.75, 0.5
+    T_steps = run_args.num_inference_steps
     overlap_ratio_list_1_f = [
-        overlap_ratio_list_1_f_org[i * len(overlap_ratio_list_1_f_org) // run_args.num_inference_steps] for i in
-        range(run_args.num_inference_steps)]
-    print(f"overlap_ratio_list for 1x F: {overlap_ratio_list_1_f}")
+        r_max - (r_max - r_min) / 2 * (1 - math.cos(math.pi * i / max(1, T_steps - 1)))
+        for i in range(T_steps)
+    ]
+    print(f"overlap_ratio_list for 1x F (cosine): {overlap_ratio_list_1_f[:3]}...{overlap_ratio_list_1_f[-3:]}")
 
-    overlap_ratio_list_2_f_org = [0.75, 0.5]
-    overlap_ratio_list_2_f = [overlap_ratio_list_2_f_org[i * len(overlap_ratio_list_2_f_org) // run_args.num_inference_steps] for i in range(run_args.num_inference_steps)]
-    print(f"overlap_ratio_list for 1x F: {overlap_ratio_list_2_f}")
+    overlap_ratio_list_2_f = [
+        r_max - (r_max - r_min) / 2 * (1 - math.cos(math.pi * i / max(1, T_steps - 1)))
+        for i in range(T_steps)
+    ]
+    print(f"overlap_ratio_list for 2x F (cosine): {overlap_ratio_list_2_f[:3]}...{overlap_ratio_list_2_f[-3:]}")
 
+    # Cosine decay for merge_prev_denoised (strong early, drops in refinement phase)
     if vargs.merge_denoised:
-        merge_prev_denoised_ratio_list = [vargs.max_merge_denoised_overlap_latent_ratio * (1 - t / vargs._merge_prev_step) for t in range(vargs._merge_prev_step)] + [0] * (run_args.num_inference_steps - vargs._merge_prev_step)
-
-        print(f"merge_prev_denoised_ratio_list: {merge_prev_denoised_ratio_list}")
+        merge_prev_denoised_ratio_list = [
+            vargs.max_merge_denoised_overlap_latent_ratio / 2 * (1 + math.cos(math.pi * t / max(1, vargs._merge_prev_step)))
+            for t in range(vargs._merge_prev_step)
+        ] + [0.0] * (run_args.num_inference_steps - vargs._merge_prev_step)
+        print(f"merge_prev_denoised_ratio_list (cosine decay): {merge_prev_denoised_ratio_list[:3]}...{merge_prev_denoised_ratio_list[vargs._merge_prev_step-3:vargs._merge_prev_step]}")
     else:
         merge_prev_denoised_ratio_list = None
 
@@ -544,5 +573,6 @@ if __name__ == "__main__":
          upscale_factor=upscale_factor,
 
          merge_prev_denoised_ratio_list=merge_prev_denoised_ratio_list,
+         temporal_guidance_scale=getattr(vargs, 'temporal_guidance_scale', None),
 
          save_latents=save_latents)

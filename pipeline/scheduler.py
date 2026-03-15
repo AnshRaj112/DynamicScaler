@@ -95,16 +95,28 @@ class lvdm_DDIM_Scheduler(object):
 
         return x_prev, pred_x0
 
-    def re_noise(self, x_a, step_a, step_b):
+    def re_noise(self, x_a, step_a, step_b, noise_pred_a=None):
+        """Re-noising from step_a to step_b. If noise_pred_a is provided, use DDIM-inversion-style
+        re-noising to preserve structure; otherwise use direct (independent Gaussian) re-noising."""
         timestep_a = self.ddim_timesteps[step_a]
         timestep_b = self.ddim_timesteps[step_b]
         alpha_cumprod = self.alphas_cumprod.to(x_a.device)
         alpha_cumprod_a = alpha_cumprod[timestep_a]
         alpha_cumprod_b = alpha_cumprod[timestep_b]
-        c = torch.sqrt(alpha_cumprod_b / alpha_cumprod_a)
-        s = torch.sqrt(1 - alpha_cumprod_b / alpha_cumprod_a)
-        epsilon_tilde = torch.randn_like(x_a)
 
-        x_b = c * x_a + s * epsilon_tilde
+        if noise_pred_a is not None:
+            # DDIM-inversion-style: x0_hat = (x_a - sqrt(1-alpha_a)*eps_hat_a)/sqrt(alpha_a)
+            # x_b = sqrt(alpha_b)*x0_hat + sqrt(1-alpha_b-sigma_b^2)*eps_hat_a + sigma_b*eps
+            sqrt_alpha_a = torch.sqrt(alpha_cumprod_a)
+            sqrt_one_minus_alpha_a = torch.sqrt(1.0 - alpha_cumprod_a)
+            pred_x0 = (x_a - sqrt_one_minus_alpha_a * noise_pred_a) / sqrt_alpha_a
+            sigma_b_val = self.ddim_sigmas[step_b] if step_b < len(self.ddim_sigmas) else 0.0
+            sigma_b = torch.as_tensor(sigma_b_val, device=x_a.device, dtype=x_a.dtype)
+            coeff_dt = torch.sqrt(1.0 - alpha_cumprod_b - sigma_b ** 2 + 1e-8)
+            x_b = torch.sqrt(alpha_cumprod_b) * pred_x0 + coeff_dt * noise_pred_a + sigma_b * torch.randn_like(x_a)
+        else:
+            c = torch.sqrt(alpha_cumprod_b / alpha_cumprod_a)
+            s = torch.sqrt(1 - alpha_cumprod_b / alpha_cumprod_a)
+            x_b = c * x_a + s * torch.randn_like(x_a)
 
         return x_b

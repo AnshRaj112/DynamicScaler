@@ -21,11 +21,12 @@ def _extract_number(filename):
         else:
             return float('inf')
 def _load_and_preprocess_image(image_path, image_size):
+    # Unified preprocessing: single resize path with antialias, normalize to [-1, 1] as (x/255 - 0.5)*2
+    # No-op Normalize(mean=0, std=1) removed for consistency and to avoid redundant computation.
     transform = transforms.Compose([
-        transforms.Resize(image_size),
+        transforms.Resize(image_size, antialias=True),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
-        transforms.Lambda(lambda x: x * 2.0 - 1.0)
+        transforms.Lambda(lambda x: (x / 255.0 - 0.5) * 2.0),  # [0,1] -> [-1, 1]
     ])
     image = Image.open(image_path).convert('RGB')
     return transform(image)

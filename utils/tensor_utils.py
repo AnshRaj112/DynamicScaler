@@ -7,11 +7,14 @@ from PIL import Image
 def load_image_tensor_from_path(image_path: str, height: int, width: int, norm_to_1=True):
     img = Image.open(image_path).convert("RGB")
     rgb_img = np.array(img, np.float32)
-    rgb_img = cv2.resize(rgb_img, (width, height), interpolation=cv2.INTER_LINEAR)
-    img_tensor = torch.from_numpy(rgb_img).permute(2, 0, 1)  # .float()
+    # Unified resize: INTER_AREA for downscale (quality), INTER_LANCZOS4 for upscale
+    h_src, w_src = rgb_img.shape[:2]
+    interp = cv2.INTER_AREA if (height < h_src or width < w_src) else cv2.INTER_LANCZOS4
+    rgb_img = cv2.resize(rgb_img, (width, height), interpolation=interp)
+    img_tensor = torch.from_numpy(rgb_img).permute(2, 0, 1)
 
     if norm_to_1:
-        img_tensor = (img_tensor / 255. - 0.5) * 2  # Normalize to [-1, 1]
+        img_tensor = (img_tensor / 255.0 - 0.5) * 2.0  # Normalize to [-1, 1]
 
     return img_tensor
 
