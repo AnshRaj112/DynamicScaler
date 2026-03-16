@@ -6,7 +6,7 @@ import os
 import shutil
 import argparse
 from dataclasses import dataclass, field
-
+import gc
 from dataclasses import dataclass
 from typing import Dict, Optional
 
