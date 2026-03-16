@@ -791,12 +791,16 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
         if num_windows_w == 1:
             image_offset_step_size_w = 0
             latent_offset_step_size_w = 0
+        else:
+            # In low-resolution / low-memory settings the integer division can drop below 1;
+            # clamp to at least 1 so the assertion does not fail and windows still shift.
+            if latent_offset_step_size_w < 1:
+                latent_offset_step_size_w = 1
 
         print(f"Shift for W: \n"
               f"overlape_ratio_w = 1 - (total_w/width - 1) / (num_windows_w - 1) = 1 - ({total_w}/{width} - 1) / ({num_windows_w} - 1) = {overlap_ratio_w}\n"
               f"image_offset_step_size_w = int(overlap_ratio_w * total_w / offset_loop_step) = int({overlap_ratio_w} * {total_w} / {loop_step}) = int({overlap_ratio_w * total_w / loop_step}) = {image_offset_step_size_w}")
         assert 0 <= overlap_ratio_w < 1, "overlap ratio for W is not legal"
-        assert latent_offset_step_size_w >= 1, "latent_offset_step_size_w should > 1"
 
         overlap_ratio_h = 1 - (total_h/height - 1) / (num_windows_h - 1)
 
