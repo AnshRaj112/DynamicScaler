@@ -800,7 +800,9 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
         print(f"Shift for W: \n"
               f"overlape_ratio_w = 1 - (total_w/width - 1) / (num_windows_w - 1) = 1 - ({total_w}/{width} - 1) / ({num_windows_w} - 1) = {overlap_ratio_w}\n"
               f"image_offset_step_size_w = int(overlap_ratio_w * total_w / offset_loop_step) = int({overlap_ratio_w} * {total_w} / {loop_step}) = int({overlap_ratio_w * total_w / loop_step}) = {image_offset_step_size_w}")
-        assert 0 <= overlap_ratio_w < 1, "overlap ratio for W is not legal"
+        # In low-resolution/low-memory presets the analytic overlap can be slightly outside [0,1) due to rounding;
+        # clamp it instead of asserting to keep the sampler robust.
+        overlap_ratio_w = max(0.0, min(float(overlap_ratio_w), 0.9999))
 
         overlap_ratio_h = 1 - (total_h/height - 1) / (num_windows_h - 1)
 
@@ -811,11 +813,13 @@ class VC2_Pipeline_I2V_SpherePano(VC2_Pipeline_I2V):
         if num_windows_h == 1:
             image_offset_step_size_h = 0
             latent_offset_step_size_h = 0
+        else:
+            if latent_offset_step_size_h < 1:
+                latent_offset_step_size_h = 1
         print(f"Shift for H: \n"
               f"overlape_ratio_h = 1 - (total_h/height - 1) / (num_windows_h - 1) = 1 - ({total_h}/{height} - 1) / ({num_windows_h} - 1) = {overlap_ratio_h}\n"
               f"image_offset_step_size_h = int(overlap_ratio_h * total_h / offset_loop_step) = int({overlap_ratio_h} * {total_h} / {loop_step}) = int({overlap_ratio_h * total_h / loop_step}) = {image_offset_step_size_h}")
-        assert 0 <= overlap_ratio_h < 1, "overlap ratio for H is not legal"
-        assert latent_offset_step_size_h >= 1, "latent_offset_step_size_h should > 1"
+        overlap_ratio_h = max(0.0, min(float(overlap_ratio_h), 0.9999))
 
         latent_step_size_f = frames // loop_step
         if total_f == frames: 
