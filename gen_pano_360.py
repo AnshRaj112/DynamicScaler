@@ -416,7 +416,13 @@ if __name__ == "__main__":
     run_args = RunArgs()
     run_args.seed = vargs.seed
     run_args.base_ckpt_path = "./videocrafter_models/i2v_512_v1/model.ckpt"
-    run_args.num_inference_steps = 48
+    # Fewer steps and smaller UNet resolution in low-memory mode to avoid OOM on 16GB GPUs
+    if vargs.low_memory:
+        run_args.num_inference_steps = 24
+        run_args.height = 256
+        run_args.width = 384
+    else:
+        run_args.num_inference_steps = 48
     run_args.fps = 8
     prompt = vargs.prompt
 
@@ -447,8 +453,13 @@ if __name__ == "__main__":
 
     # Sphere Pano Basic
     downsample_factor_before_vae_decode = 1
-    equirect_width = int(1024 * downsample_factor_before_vae_decode)
-    equirect_height = int(512 * downsample_factor_before_vae_decode)
+    # Use a smaller base equirect size in low-memory mode so the sphere stage (which uses *2) fits in 16GB.
+    if vargs.low_memory:
+        equirect_width = 512
+        equirect_height = 256
+    else:
+        equirect_width = int(1024 * downsample_factor_before_vae_decode)
+        equirect_height = int(512 * downsample_factor_before_vae_decode)
 
     view_fov = vargs.view_fov #
 
