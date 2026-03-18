@@ -18,7 +18,7 @@ class VArgs:
     # ============ CONFIGS ============= #
     seed: int = 2333333
     gpu_id: int = 0
-    mode: Literal["static", "dynamic"] = "static"
+    mode: Literal["static", "static_model", "dynamic"] = "static"
     # main input panorama image
     pano_image_path: str = "./input/pano_surfing_1.png"
 
@@ -277,7 +277,7 @@ def run_dynamic_video_generation(vargs: "VArgs"):
 
     from scripts.evaluation.funcs import load_model_checkpoint
     from utils.utils import instantiate_from_config, create_dir
-    from utils.loop_merge_utils import save_decoded_video_latents
+    from utils.loop_merge_utils import save_decoded_video_latents, tensor2image
     from utils.diffusion_utils import resize_video_latent
     from pipeline.i2v_sphere_panorama_pipeline import VC2_Pipeline_I2V_SpherePano
     from pipeline.scheduler import lvdm_DDIM_Scheduler
@@ -430,13 +430,26 @@ def run_dynamic_video_generation(vargs: "VArgs"):
 
             if save_latents:
                 torch.save(sphere_SW_latent, os.path.join(output_dir, "sphere_SW_latent.pt"))
-                # torch.save(basic_SW_video_frames, os.path.join(output_dir, "basic_SW_video_frames.pt"))
             if getattr(vargs, 'low_memory', False):
                 torch.cuda.empty_cache()
                 gc.collect()
         else:
             print(f"loading SW latent from {vargs.predenoised_SP_latent_path}")
             sphere_SW_latent = torch.load(vargs.predenoised_SP_latent_path)
+
+        # ----- STATIC MODEL-BASED PANORAMA BRANCH -----
+        if vargs.mode == "static_model":
+            print("==== Static sphere panorama decode (no video) ====")
+            # Decode denoised sphere latents to RGB frames: B, C, T, H, W
+            decoded = model.decode_first_stage_2DAE(sphere_SW_denoised)
+            # Take the first frame
+            first_frame = decoded[:, :, [0]]  # B, C, 1, H, W
+            pano_img = tensor2image(first_frame)
+            out_name = "sphere_pano_static.png"
+            out_path = os.path.join(output_dir, out_name)
+            pano_img.save(out_path)
+            print(f"[static_model] wrote panorama image: {out_path}")
+            return
 
         print("==== Normal Plane Shift Windows Sample ====")
 
