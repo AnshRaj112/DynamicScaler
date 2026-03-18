@@ -664,7 +664,8 @@ def run_dynamic_video_generation(vargs: "VArgs"):
     num_windows_h_2 = 2
     num_windows_w_2 = 2
 
-    total_f = vargs.total_f
+    # total_f must be >= frames (16) for the sphere sampler; clamp to avoid ValueError.
+    total_f = max(int(vargs.total_f), 16)
     dock_at_f = vargs.dock_at_f
     loop_step_frame = vargs.loop_step_frame
 
