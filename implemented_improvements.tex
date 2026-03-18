@@ -116,7 +116,7 @@ The value of \fn{temporal_guidance_scale} is threaded into the sphere panorama p
 \paragraph{Previous.}
 The base video diffusion sampler always ran with:
 \[
-    \text{height}=512,\quad \text{width}=1024,\quad \text{num\_steps}=48.
+    \text{height}=320,\quad \text{width}=512,\quad \text{num\_steps}=48.
 \]
 
 \paragraph{New.}
@@ -124,7 +124,7 @@ At the script entry point, these are now conditioned on \fn{vargs.low\_memory}:
 \begin{itemize}
     \item If \fn{low\_memory=False}:
     \[
-        \text{height}=512,\quad \text{width}=1024,\quad \text{num\_steps}=48.
+        \text{height}=320,\quad \text{width}=512,\quad \text{num\_steps}=48.
     \]
     \item If \fn{low\_memory=True}:
     \[
@@ -282,6 +282,124 @@ are inserted after key stages.
 \paragraph{Purpose.}
 This reduces VRAM fragmentation and releases memory from temporary tensors that are no longer needed,
 making it more likely that subsequent stages (especially 1$\times$ planar denoising) will fit into the 16\,GB budget.
+
+\subsection{Static Panorama Generation Modes (No Video Required)}
+
+\paragraph{Motivation.}
+The original script \file{gen\_pano\_360.py} was designed to produce \emph{dynamic} panorama videos, i.e.\ a sequence of frames saved as MP4/GIF.
+For many users (and especially low-memory environments like Kaggle P100) this is overkill when the goal is simply a single \emph{static} 360 panorama still image.
+In addition, always importing the full diffusion stack (Torch, Diffusers, checkpoints) imposes overhead even when a user only wants a lightweight image postprocess.
+
+\paragraph{New.}
+The script now supports multiple \emph{modes} via \fn{VArgs.mode}:
+\begin{itemize}[nosep]
+    \item \textbf{\texttt{static}}: lightweight ``save-as-panorama'' path that reads an image, enforces 2:1 aspect, resizes, and writes a single output image (no model load).
+    \item \textbf{\texttt{static\_wrap}}: a deterministic, purely geometric method that converts \emph{any} image into an equirectangular panorama by horizontal wrap/tiling and seam blending (no model load; designed for P100/CPU reliability).
+    \item \textbf{\texttt{static\_model}}: a model-based still generator that runs the sphere panorama diffusion stage and then writes a single decoded panorama image (no video writing).
+    \item \textbf{\texttt{dynamic}}: the legacy, full video-generation pipeline is preserved.
+\end{itemize}
+
+\paragraph{Purpose.}
+This is a practical engineering separation of concerns:
+\begin{itemize}[nosep]
+    \item \textbf{Fast path}: when the input is already an equirect panorama, \texttt{static} provides a robust ``export'' step and an optional viewer.
+    \item \textbf{Guaranteed path}: when the user only needs an understandable 360 image on limited hardware, \texttt{static\_wrap} avoids diffusion entirely.
+    \item \textbf{Generative path}: when the user wants the model to alter the panorama content (but not output a video), \texttt{static\_model} provides a still-image endpoint.
+\end{itemize}
+
+\subsection{Static Viewer Output (Optional HTML 360 Viewer)}
+
+\paragraph{New.}
+Both \texttt{static} and \texttt{static\_wrap} optionally write a minimal HTML viewer file \file{viewer.html} next to the output image.
+The viewer uses a CDN-hosted equirectangular panorama viewer (Pannellum) so that a user can immediately ``look around'' the static panorama.
+
+\paragraph{Purpose.}
+This directly addresses a common UX confusion: a valid equirectangular panorama \emph{looks} like a stretched image when viewed flat, but becomes understandable once rendered in a 360 viewer.
+
+\subsection{Static Wrap Panorama: Mathematical Construction and Seam Blending}
+
+\paragraph{New.}
+Mode \texttt{static\_wrap} implements a deterministic panorama construction with explicit seam suppression.
+Given an input image \(I\in\mathbb{R}^{H\times W\times 3}\), an output height \(H_o\), and width \(W_o=2H_o\), the algorithm:
+\begin{enumerate}[nosep]
+    \item Resizes the input to height \(H_o\) while preserving aspect ratio, producing \(I_r\in\mathbb{R}^{H_o\times W_r\times 3}\).
+    \item Tiles \(I_r\) horizontally enough times to exceed \(W_o\), then center-crops to width \(W_o\) to obtain \(P\in\mathbb{R}^{H_o\times W_o\times 3}\).
+    \item Blends the left and right edges over an overlap of \(k=\texttt{wrap\_overlap\_px}\) pixels to enforce cyclic consistency.
+\end{enumerate}
+
+\paragraph{Seam blending.}
+Let \(P_L = P[:,0:k,:]\) and \(P_R = P[:,W_o-k:W_o,:]\).
+Define a linear ramp \(\alpha(j)=\frac{j}{k-1}\) for \(j=0,\dots,k-1\).
+The blended edges are:
+\[
+    P[:,j,:] \leftarrow (1-\alpha(j))\,P_L[:,j,:] + \alpha(j)\,P_R[:,j,:],
+    \qquad
+    P[:,W_o-k+j,:] \leftarrow (1-\alpha(j))\,P_R[:,j,:] + \alpha(j)\,P_L[:,j,:].
+\]
+Optionally, the implementation mirrors edge content prior to blending (\texttt{wrap\_mirror\_edges=True}) to reduce visible discontinuities for high-contrast textures.
+
+\paragraph{Purpose.}
+This is intentionally simple and robust:
+\begin{itemize}[nosep]
+    \item It runs in seconds and uses negligible VRAM.
+    \item It produces an equirect panorama that is immediately viewable and ``360-correct'' in the sense of left/right wrap continuity.
+    \item It is the recommended baseline for Kaggle P100 when the user's priority is a stable, interpretable output rather than generative scene completion.
+\end{itemize}
+
+\subsection{Static Model Panorama: Still-Image Endpoint for Sphere Diffusion}
+
+\paragraph{Problem.}
+The sphere panorama diffusion stage is implemented as a \emph{video} latent sampler: even when the user wants a single still, the sampler produces a tensor with time dimension \(T\) and the decoded frames may vary, producing blotchy or mosaic-like artifacts when a single arbitrary frame is chosen.
+
+\paragraph{New.}
+Mode \texttt{static\_model} runs the sphere stage and then writes a single image, with an additional blending control:
+\begin{itemize}[nosep]
+    \item \texttt{static\_model\_blend=first}: save frame 0.
+    \item \texttt{static\_model\_blend=last}: save the last frame.
+    \item \texttt{static\_model\_blend=mean}: decode all frames and average across time before converting to an image.
+\end{itemize}
+The mean blend corresponds to:
+\[
+    \bar{X} = \frac{1}{T}\sum_{t=1}^{T} X_t,\qquad \text{then save }\bar{X},
+\]
+where \(X_t\) are decoded RGB tensors in \([-1,1]\).
+
+\paragraph{Purpose.}
+Time-averaging reduces high-variance per-frame artifacts while preserving the dominant structure, typically yielding a cleaner still on limited GPUs without resorting to video output.
+
+\subsection{Command-Line Robustness: Boolean Flags and \texttt{default\_factory} Fields}
+
+\paragraph{Problem.}
+The original CLI autogeneration used \texttt{type=bool} for boolean fields, which is a known \texttt{argparse} pitfall (\texttt{bool("False") == True}).
+Additionally, dataclass fields with \texttt{default\_factory} (e.g.\ dictionaries) can be corrupted if \texttt{argparse} injects a sentinel default into the constructor, producing runtime errors such as:
+\[
+    \texttt{AttributeError: '\_MISSING\_TYPE' object has no attribute 'items'}.
+\]
+
+\paragraph{New.}
+\begin{itemize}[nosep]
+    \item Boolean CLI fields now use \texttt{BooleanOptionalAction}, enabling the pattern \texttt{--flag} / \texttt{--no-flag} without passing string booleans.
+    \item Fields that use \texttt{default\_factory} are intentionally \emph{not} registered as CLI options in the auto-generated argument loop; this prevents \texttt{argparse} from overriding factory-generated values with missing sentinels.
+\end{itemize}
+
+\paragraph{Purpose.}
+These changes make the script reliable in notebook environments (Kaggle/Colab) and reduce user friction when switching modes or disabling features like upscaling.
+
+\subsection{Safety Clamp: Ensuring \texttt{total\_f} is Valid for Sphere Sampling}
+
+\paragraph{Problem.}
+The sphere sampler enforces \(\texttt{total\_f} \ge \texttt{frames}\) (where \texttt{frames=16} in the current configuration).
+Setting \texttt{total\_f<16} causes an immediate \texttt{ValueError}.
+
+\paragraph{New.}
+The entrypoint now clamps:
+\[
+    \texttt{total\_f} \leftarrow \max(\texttt{total\_f}, 16),
+\]
+ensuring valid invocation for static-model usage when users attempt to reduce temporal length for memory.
+
+\paragraph{Purpose.}
+This prevents confusing crashes and encourages memory reduction through supported levers (\texttt{low\_memory}, resolution, disabling upscaling) rather than invalid temporal settings.
 
 %==============================================================================
 \section{Sphere Panorama Pipeline: \file{i2v\_sphere\_panorama\_pipeline.py}}
