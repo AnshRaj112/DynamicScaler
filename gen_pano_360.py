@@ -31,6 +31,7 @@ class VArgs:
     static_height: int = 1024
     static_fit: Literal["crop", "pad", "stretch"] = "crop"  # how to enforce 2:1 aspect ratio
     write_viewer_html: bool = True  # writes a minimal HTML viewer (CDN-based) alongside the image
+    static_model_blend: Literal["mean", "last", "first"] = "mean"
 
     # Default prompt & phi_prompt_dict used by the dynamic pipeline; safe via default_factory.
     prompt: str = (
@@ -453,9 +454,13 @@ def run_dynamic_video_generation(vargs: "VArgs"):
             print("==== Static sphere panorama decode (no video) ====")
             # Decode denoised sphere latents to RGB frames: B, C, T, H, W
             decoded = model.decode_first_stage_2DAE(sphere_SW_denoised)
-            # Take the first frame
-            first_frame = decoded[:, :, [0]]  # B, C, 1, H, W
-            pano_img = tensor2image(first_frame)
+            if vargs.static_model_blend == "mean":
+                blended = decoded.mean(dim=2, keepdim=True)  # B, C, 1, H, W
+                pano_img = tensor2image(blended)
+            elif vargs.static_model_blend == "last":
+                pano_img = tensor2image(decoded[:, :, [-1]])
+            else:
+                pano_img = tensor2image(decoded[:, :, [0]])
             out_name = "sphere_pano_static.png"
             out_path = os.path.join(output_dir, out_name)
             pano_img.save(out_path)
