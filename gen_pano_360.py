@@ -20,7 +20,7 @@ class VArgs:
     gpu_id: int = 0
     mode: Literal["static", "static_model", "dynamic"] = "static"
     # main input panorama image
-    pano_image_path: str = "./input/pano_surfing_1.png"
+    pano_image_path: str = "./input/geometric_pattern_1.jpg"
 
     # ============ STATIC PANORAMA CONFIGS ============= #
     # These are used when mode="static" to write a single panorama image and exit.
@@ -35,20 +35,20 @@ class VArgs:
 
     # Default prompt & phi_prompt_dict used by the dynamic pipeline; safe via default_factory.
     prompt: str = (
-        "Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, "
-        "breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon"
+        "Clean high-contrast geometric tessellation pattern, sharp lines, crisp dots, "
+        "uniform spacing, seamless repeating texture, flat lighting, minimal noise"
     )
     phi_prompt_dict: Dict[int, str] = field(
         default_factory=lambda: {
-            90: "Clear light blue sky",
-            75: "Clear light blue sky",
-            60: "Clear light blue sky",
-            45: "Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon",
-            0: "Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon",
-            -45: "green blue ocean with waves and swirling foam patterns",
-            -60: "green blue ocean with waves",
-            -75: "green blue ocean water",
-            -90: "green blue ocean water",
+            90: "Clean geometric pattern, bright white background, sharp black lines",
+            75: "Clean geometric pattern, sharp linework, uniform spacing",
+            60: "Geometric tessellation, crisp edges, high contrast",
+            45: "Seamless geometric repeating pattern, sharp lines and dots",
+            0: "Seamless geometric repeating pattern, sharp lines and dots, high contrast",
+            -45: "Geometric pattern, crisp edges, uniform spacing, minimal blur",
+            -60: "Clean geometric pattern, sharp lines, high contrast",
+            -75: "Clean geometric pattern, bright background, sharp black linework",
+            -90: "Clean geometric pattern, bright background, sharp black linework",
         }
     )
 
