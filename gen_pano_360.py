@@ -77,9 +77,17 @@ class VArgs:
 
     @classmethod
     def from_args(cls):
+        from dataclasses import MISSING
+
         parser = argparse.ArgumentParser()
+        # IMPORTANT: fields using default_factory (e.g. dict/list) must not be registered with argparse
+        # with a MISSING default, otherwise argparse will set them to a sentinel and override the factory.
+        skipped_factory_fields = set()
         for field_name, field_def in cls.__dataclass_fields__.items():
             default = field_def.default
+            if default is MISSING and field_def.default_factory is not MISSING:
+                skipped_factory_fields.add(field_name)
+                continue
             # bool flags need special handling; argparse's bool("False") == True is a common pitfall.
             if isinstance(default, bool):
                 parser.add_argument(
@@ -96,7 +104,10 @@ class VArgs:
                     help=f"{field_name} (default: {default})",
                 )
         args = parser.parse_args()
-        return cls(**vars(args))
+        kwargs = vars(args)
+        for k in skipped_factory_fields:
+            kwargs.pop(k, None)
+        return cls(**kwargs)
 
 
 def _ensure_dir(path: str) -> str:
