@@ -13,17 +13,10 @@ SKIP_2X_UPSCALE_TO_AVOID_OOM = True
 
 
 @dataclass
-class SP_INPUT:
-    prompt: str
-    pano_image_path: str
-    phi_prompt_dict: Dict[int, str]
-    window_multi_prompt_dict: Dict[float, str] = None
-
-@dataclass
 class VArgs:
 
     # ============ CONFIGS ============= #
-    seed:   int = 2333333
+    seed: int = 2333333
     gpu_id: int = 0
     mode: Literal["static", "dynamic"] = "static"
     # main input panorama image
@@ -39,10 +32,13 @@ class VArgs:
     static_fit: Literal["crop", "pad", "stretch"] = "crop"  # how to enforce 2:1 aspect ratio
     write_viewer_html: bool = True  # writes a minimal HTML viewer (CDN-based) alongside the image
 
-    sp_inputs = SP_INPUT(
-        prompt="Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon",
-        pano_image_path=pano_image_path,
-        phi_prompt_dict={
+    # Default prompt & phi_prompt_dict used by the dynamic pipeline; safe via default_factory.
+    prompt: str = (
+        "Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, "
+        "breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon"
+    )
+    phi_prompt_dict: Dict[int, str] = field(
+        default_factory=lambda: {
             90: "Clear light blue sky",
             75: "Clear light blue sky",
             60: "Clear light blue sky",
@@ -52,15 +48,12 @@ class VArgs:
             -60: "green blue ocean with waves",
             -75: "green blue ocean water",
             -90: "green blue ocean water",
-        },
+        }
     )
 
-    prompt: str = sp_inputs.prompt
-    phi_prompt_dict: Dict[int, str] = sp_inputs.phi_prompt_dict
-
-    total_f: int = 16 
-    do_upscale: bool = True 
-    upscale_factor = 2
+    total_f: int = 16
+    do_upscale: bool = True
+    upscale_factor: int = 2
 
     # ============ ADVANCED CONFIGS ============= #
     phi_num:            int = 6     # 6
