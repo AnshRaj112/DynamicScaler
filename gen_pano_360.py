@@ -18,7 +18,7 @@ class VArgs:
     # ============ CONFIGS ============= #
     seed: int = 2333333
     gpu_id: int = 0
-    mode: Literal["static", "static_model", "dynamic"] = "static"
+    mode: Literal["static", "static_wrap", "static_model", "dynamic"] = "static"
     # main input panorama image
     pano_image_path: str = "./input/geometric_pattern_1.jpg"
 
@@ -32,6 +32,9 @@ class VArgs:
     static_fit: Literal["crop", "pad", "stretch"] = "crop"  # how to enforce 2:1 aspect ratio
     write_viewer_html: bool = True  # writes a minimal HTML viewer (CDN-based) alongside the image
     static_model_blend: Literal["mean", "last", "first"] = "mean"
+    # Used when mode="static_wrap": make a simple wrap-around panorama from any image (no diffusion).
+    wrap_overlap_px: int = 64  # seam blending overlap in pixels (in output image space)
+    wrap_mirror_edges: bool = True  # mirror edges before blending to hide harsh seams
 
     # Default prompt & phi_prompt_dict used by the dynamic pipeline; safe via default_factory.
     prompt: str = (
@@ -256,6 +259,93 @@ def run_static_panorama(vargs: "VArgs") -> str:
         _write_static_viewer_html(out_dir, os.path.basename(out_img), title=os.path.basename(out_img))
 
     print(f"[static] wrote panorama image: {out_img}")
+    return out_img
+
+
+def run_static_wrap_panorama(vargs: "VArgs") -> str:
+    """
+    Create a simple, understandable equirect panorama from a single image by:
+    - enforcing 2:1 aspect output (WxH)
+    - resizing input to output height
+    - tiling horizontally to fill output width (wrap-around)
+    - blending the left/right seam over wrap_overlap_px
+
+    This does NOT use any diffusion model and is designed to work reliably on low-VRAM GPUs/CPU.
+    """
+    import numpy as np
+    import imageio.v3 as iio
+
+    in_path = vargs.pano_image_path
+    if not os.path.exists(in_path):
+        raise FileNotFoundError(f"Input image not found: {in_path}")
+
+    out_dir = _ensure_dir(vargs.static_out_dir)
+    stem = os.path.splitext(os.path.basename(in_path))[0]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = vargs.static_name or f"{stem}_wrap_{ts}"
+    ext = "jpg" if vargs.static_format == "jpg" else "png"
+    out_img = os.path.join(out_dir, f"{name}.{ext}")
+
+    img = iio.imread(in_path)
+    if img.ndim == 2:
+        img = np.stack([img, img, img], axis=-1)
+    if img.shape[-1] == 4:
+        img = img[..., :3]
+
+    # Ensure uint8 for predictable blending
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+
+    H_out = int(vargs.static_height)
+    W_out = int(vargs.static_width)
+    if W_out != 2 * H_out:
+        # equirect should be 2:1; force it for predictable viewing
+        W_out = 2 * H_out
+
+    # Resize input to output height, keep aspect
+    h, w = img.shape[:2]
+    scale = H_out / max(1, h)
+    new_w = max(1, int(round(w * scale)))
+    try:
+        import cv2
+
+        img_rs = cv2.resize(img, (new_w, H_out), interpolation=cv2.INTER_LANCZOS4)
+    except Exception:
+        yy = (np.linspace(0, h - 1, H_out)).astype(np.int64)
+        xx = (np.linspace(0, w - 1, new_w)).astype(np.int64)
+        img_rs = img[yy][:, xx]
+
+    # Tile horizontally to fill width
+    reps = int(math.ceil(W_out / img_rs.shape[1])) + 2
+    tiled = np.concatenate([img_rs] * reps, axis=1)
+    start_x = (tiled.shape[1] - W_out) // 2
+    pano = tiled[:, start_x : start_x + W_out].copy()
+
+    # Blend seam between left and right edges
+    overlap = max(0, int(vargs.wrap_overlap_px))
+    overlap = min(overlap, W_out // 4)
+    if overlap >= 4:
+        left = pano[:, :overlap].astype(np.float32)
+        right = pano[:, -overlap:].astype(np.float32)
+
+        if vargs.wrap_mirror_edges:
+            # Mirror to reduce abrupt transitions
+            left_src = left[:, ::-1]
+            right_src = right[:, ::-1]
+        else:
+            left_src = left
+            right_src = right
+
+        alpha = np.linspace(0.0, 1.0, overlap, dtype=np.float32)[None, :, None]
+        # Make left edge gradually become right content (and vice versa) to enforce cyclic consistency
+        pano[:, :overlap] = (left_src * (1 - alpha) + right_src * alpha).astype(np.uint8)
+        pano[:, -overlap:] = (right_src * (1 - alpha[:, ::-1]) + left_src * alpha[:, ::-1]).astype(np.uint8)
+
+    iio.imwrite(out_img, pano)
+    if vargs.write_viewer_html:
+        _write_static_viewer_html(out_dir, os.path.basename(out_img), title=os.path.basename(out_img))
+
+    print(f"[static_wrap] wrote panorama image: {out_img}")
     return out_img
 
 @dataclass
@@ -758,6 +848,9 @@ if __name__ == "__main__":
 
     if vargs.mode == "static":
         run_static_panorama(vargs)
+        raise SystemExit(0)
+    if vargs.mode == "static_wrap":
+        run_static_wrap_panorama(vargs)
         raise SystemExit(0)
 
     # dynamic / legacy behavior
