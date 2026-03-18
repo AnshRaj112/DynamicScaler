@@ -26,6 +26,8 @@ class VArgs:
     seed:   int = 2333333
     gpu_id: int = 0
     mode: Literal["static", "dynamic"] = "static"
+    # main input panorama image
+    pano_image_path: str = "./input/pano_surfing_1.png"
 
     # ============ STATIC PANORAMA CONFIGS ============= #
     # These are used when mode="static" to write a single panorama image and exit.
@@ -39,23 +41,22 @@ class VArgs:
 
     sp_inputs = SP_INPUT(
         prompt="Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon",
-        pano_image_path="./input/pano_surfing_1.png",
-        phi_prompt_dict = {
+        pano_image_path=pano_image_path,
+        phi_prompt_dict={
             90: "Clear light blue sky",
             75: "Clear light blue sky",
             60: "Clear light blue sky",
             45: "Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon",
-            0:  "Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon",
+            0: "Massive green blue ocean wave, dynamic ocean spray, dynamic water motion, breaking waves with white foam, seabirds in motion, turquoise water transparency, distant ocean horizon",
             -45: "green blue ocean with waves and swirling foam patterns",
             -60: "green blue ocean with waves",
             -75: "green blue ocean water",
             -90: "green blue ocean water",
-        }
+        },
     )
 
-    pano_image_path = sp_inputs.pano_image_path
-    prompt = sp_inputs.prompt
-    phi_prompt_dict = sp_inputs.phi_prompt_dict
+    prompt: str = sp_inputs.prompt
+    phi_prompt_dict: Dict[int, str] = sp_inputs.phi_prompt_dict
 
     total_f: int = 16 
     do_upscale: bool = True 
