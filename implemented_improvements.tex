@@ -1,0 +1,695 @@
+% DynamicScaler Implemented Changes Report
+% Based on comparison: https://github.com/sh-Lin/DynamicScaler/compare/main...AnshRaj112:DynamicScaler:main
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{titlesec}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=green!40!black,
+    urlcolor=cyan!50!black,
+}
+
+\lstset{
+    language=Python,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red!70!black},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    showstringspaces=false,
+    tabsize=4,
+}
+
+\definecolor{enhance}{RGB}{0,100,0}
+\newcommand{\enhance}[1]{\textcolor{enhance}{\textbf{#1}}}
+\newcommand{\file}[1]{\texttt{#1}}
+\newcommand{\fn}[1]{\texttt{#1}}
+
+\title{
+    \textbf{DynamicScaler: Implemented Code, Math, and Low-Memory Improvements} \\[4pt]
+    \large From Original CVPR 2025 Release to Optimized Fork
+}
+\author{Engineering Change Log and Rationale}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document summarizes the concrete changes introduced in the fork of \textbf{DynamicScaler} relative to the original main branch, as captured by the comparison
+\href{https://github.com/sh-Lin/DynamicScaler/compare/main...AnshRaj112:DynamicScaler:main}{main\,$\dots$\,main}.
+For each modified component we describe:
+(i) the \emph{previous behavior} in code and mathematics,
+(ii) the \emph{new implementation},
+and (iii) the \emph{purpose and expected effect} on image quality, temporal stability, geometry, and low-memory operation (e.g.\ Tesla P100 with 16\,GB VRAM).
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{High-Level Overview of Changes}
+%==============================================================================
+
+The recent commits introduce three main classes of improvements:
+\begin{enumerate}
+    \item \textbf{Geometric and sampling correctness} in the panorama tensor utilities (sphere and ring), improving projection accuracy and multi-view blending.
+    \item \textbf{Diffusion pipeline behavior} changes, including DDIM-aware re-noising, temporal guidance in the sphere pipeline, smoother overlap/merge schedules, and post-decode temporal smoothing.
+    \item \textbf{Low-memory and efficiency features}, such as adaptive tiling, caching of invariant computations, resolution and step reductions in ``low-memory'' mode, and an explicit 2$\times$-upscale safety switch.
+\end{enumerate}
+
+The analysis documents \file{enhancement\_analysis.tex} and \file{comprehensive\_improvements.tex} previously proposed many of these changes.
+The current fork \emph{implements} a large subset of those proposals; this report focuses only on what has actually changed in code.
+
+%==============================================================================
+\section{Changes in \file{gen\_pano\_360.py}}
+%==============================================================================
+
+\subsection{New Configuration Flags}
+
+\paragraph{Previous.}
+The script did not expose:
+\begin{itemize}[nosep]
+    \item A temporal guidance scale for the sphere pipeline.
+    \item A global ``low-memory'' switch.
+    \item A hard safety guard to skip the 2$\times$ upscale stage on 16\,GB GPUs.
+\end{itemize}
+
+\paragraph{New.}
+The argument dataclass \fn{VArgs} now has:
+\begin{lstlisting}
+temporal_guidance_scale: Optional[float] = None
+low_memory: bool = False
+\end{lstlisting}
+and there is a module-level constant:
+\begin{lstlisting}
+SKIP_2X_UPSCALE_TO_AVOID_OOM = True
+\end{lstlisting}
+The value of \fn{temporal_guidance_scale} is threaded into the sphere panorama pipeline, and \fn{low\_memory} drives multiple conservative choices tailored to GPUs such as Tesla P100 (16\,GB).
+
+\paragraph{Purpose.}
+\begin{itemize}
+    \item \textbf{Temporal guidance scale} enables classifier-free \emph{temporal} guidance in the sphere pipeline, improving motion smoothness and frame consistency.
+    \item \textbf{Low-memory} mode centralizes all P100--class heuristics so that a single flag can be used to avoid out-of-memory errors.
+    \item \textbf{2$\times$-upscale guard} prevents the most memory-intensive VAE decode from running by default on 16\,GB cards.
+\end{itemize}
+
+\subsection{Low-Memory Denoising Resolution and Steps}
+
+\paragraph{Previous.}
+The base video diffusion sampler always ran with:
+\[
+    \text{height}=512,\quad \text{width}=1024,\quad \text{num\_steps}=48.
+\]
+
+\paragraph{New.}
+At the script entry point, these are now conditioned on \fn{vargs.low\_memory}:
+\begin{itemize}
+    \item If \fn{low\_memory=False}:
+    \[
+        \text{height}=512,\quad \text{width}=1024,\quad \text{num\_steps}=48.
+    \]
+    \item If \fn{low\_memory=True}:
+    \[
+        \text{height}=256,\quad \text{width}=384,\quad \text{num\_steps}=24.
+    \]
+\end{itemize}
+
+\paragraph{Purpose.}
+This reduces both spatial and temporal compute requirements for the UNet 3D:
+the memory footprint scales roughly with \(H \times W \times T\).
+Halving each spatial dimension and halving the number of steps makes the sphere stage tractable on 16\,GB VRAM, especially when combined with later tiling and overlap adjustments.
+
+\subsection{Low-Memory Equirectangular Base Resolution}
+
+\paragraph{Previous.}
+The base equirectangular panorama resolution was fixed to
+\[
+    W_\text{eq}=1024,\quad H_\text{eq}=512,
+\]
+and the sphere stage worked on the doubled resolution (due to internal scaling) regardless of GPU.
+
+\paragraph{New.}
+Now:
+\begin{itemize}
+    \item If \fn{low\_memory=False}, the same \(1024\times512\) baseline is preserved.
+    \item If \fn{low\_memory=True}, the sphere stage instead uses
+    \[
+        W_\text{eq}=512,\quad H_\text{eq}=256.
+    \]
+\end{itemize}
+
+\paragraph{Purpose.}
+This directly lowers the size of the 5D latent tensor \((B,C,T,H,W)\) in the sphere stage by a factor of \(4\times\).
+Although this reduces raw resolution, the later planar/1$\times$ and optional 2$\times$ pathways can restore apparent resolution while preserving temporal stability.
+
+\subsection{Latitude-Adaptive Theta Sampling}
+
+\paragraph{Previous.}
+The mapping \fn{phi\_theta\_dict} used a fixed number of azimuthal samples for most latitudes:
+\begin{lstlisting}
+phi_theta_dict = {
+    90:  [0],
+    -90: [0],
+    75:  [360*t//phi_num for t in range(phi_num)],
+    ...
+    0:   [360*t//phi_num for t in range(phi_num)],
+}
+\end{lstlisting}
+This oversampled near the poles (where longitude lines converge) and undersampled near the equator.
+
+\paragraph{New.}
+The number of theta samples per latitude \(\phi\) is now:
+\begin{equation}
+    N_\theta(\phi) = \max\bigl(1,\;\lfloor N_0 \cos(\phi \cdot \pi/180)\rfloor\bigr),
+\end{equation}
+where \(N_0=\texttt{phi\_num}\) is the base equatorial count.
+For example:
+\begin{lstlisting}
+def n_theta_for_phi(phi_deg, n0):
+    n = max(1, int(n0 * math.cos(phi_deg * math.pi / 180.0)))
+    return max(1, n)
+
+phi_theta_dict = {
+    90:  [0],
+    -90: [0],
+    75:  [360 * t // n_theta_for_phi(75, phi_num) for t in range(n_theta_for_phi(75, phi_num))],
+    ...
+    0:   [360 * t // phi_num for t in range(phi_num)],
+}
+\end{lstlisting}
+
+\paragraph{Purpose.}
+This approximates uniform solid-angle coverage:
+at latitude \(\phi\), the circumference of a parallel is proportional to \(\cos\phi\),
+so the number of theta samples should also scale with \(\cos\phi\).
+As a result:
+\begin{itemize}
+    \item Polar regions are no longer oversampled with nearly redundant views.
+    \item Equatorial regions receive more relative sampling, increasing scene richness where most content lives.
+    \item Overall compute is reduced for the same perceived coverage.
+\end{itemize}
+
+\subsection{Cosine-Annealed Overlap Ratios}
+
+\paragraph{Previous.}
+Both the 1$\times$ and 2$\times$ overlap ratios used a two-point step function between \(0.75\) and \(0.5\),
+implemented via integer indexing into a short list.
+This produced an abrupt mid-schedule change in overlap.
+
+\paragraph{New.}
+For both 1$\times$ and 2$\times$ paths a cosine-annealed schedule is used:
+\begin{equation}
+    r(t) = r_{\max} - \frac{r_{\max}-r_{\min}}{2}
+    \left(1 - \cos\frac{\pi t}{T-1}\right),
+    \quad r_{\max}=0.75,\; r_{\min}=0.5,
+\end{equation}
+for \(t=0,\dots,T-1\) where \(T\) is \fn{num\_inference\_steps}.
+
+\paragraph{Purpose.}
+The overlap between shift windows changes smoothly across timesteps, avoiding a sudden change in effective receptive field.
+Empirically this reduces temporal seam artifacts and flickering at the point where overlap would otherwise jump from \(0.75\) to \(0.5\).
+
+\subsection{Cosine Decay of Merge-Previous-Denoised Ratio}
+
+\paragraph{Previous.}
+The list \fn{merge\_prev\_denoised\_ratio\_list} decayed linearly from the maximum ratio down to zero over a fixed number of merge steps.
+Linear decay treats early and late steps equally, even though late steps are mostly detail refinement.
+
+\paragraph{New.}
+The merged ratio now uses a cosine decay:
+\begin{equation}
+    \lambda(t) = \frac{\lambda_{\max}}{2} \left(1 + \cos\frac{\pi t}{T_\text{merge}}\right),\qquad 0\le t\le T_\text{merge},
+\end{equation}
+and is set to zero thereafter.
+
+\paragraph{Purpose.}
+This keeps strong blending early, when structure is coarse and past frames provide valuable guidance, then rapidly decreases blending during the fine-detail phase.
+It improves sharpness and reduces over-smoothed textures near convergence, while maintaining loop consistency.
+
+\subsection{Latent Resize Mode: Bilinear Instead of Nearest}
+
+\paragraph{Previous.}
+The downsampled sphere SW latent used nearest-neighbor interpolation:
+\begin{lstlisting}
+downsampled_sphere_SW_latent = resize_video_latent(
+    input_latent=sphere_SW_latent.clone(),
+    mode="nearest", ...)
+\end{lstlisting}
+
+\paragraph{New.}
+The call now forces bilinear mode:
+\begin{lstlisting}
+downsampled_sphere_SW_latent = resize_video_latent(
+    input_latent=sphere_SW_latent.clone(),
+    mode="bilinear", ...)
+\end{lstlisting}
+
+\paragraph{Purpose.}
+Nearest-neighbor upscaling/downscaling in latent space introduces blockiness and aliasing.
+Using bilinear interpolation creates smoother latents which decode to cleaner images, especially when combined with the optional Gaussian blur introduced in \file{diffusion\_utils.py}.
+
+\subsection{Emptying GPU Cache Between Stages}
+
+\paragraph{Previous.}
+No explicit cache clearing occurred between sphere and planar stages, leaving peak memory potentially dominated by residual allocations from prior steps.
+
+\paragraph{New.}
+When \fn{vargs.low\_memory=True}, calls to:
+\begin{lstlisting}
+torch.cuda.empty_cache()
+gc.collect()
+\end{lstlisting}
+are inserted after key stages.
+
+\paragraph{Purpose.}
+This reduces VRAM fragmentation and releases memory from temporary tensors that are no longer needed,
+making it more likely that subsequent stages (especially 1$\times$ planar denoising) will fit into the 16\,GB budget.
+
+%==============================================================================
+\section{Sphere Panorama Pipeline: \file{i2v\_sphere\_panorama\_pipeline.py}}
+%==============================================================================
+
+\subsection{Temporal Guidance in Sphere Pipeline}
+
+\paragraph{Previous.}
+The sphere panorama pipeline only used text+image classifier-free guidance.
+Temporal guidance---already implemented in the DDIM sampler for planar videos---was not applied in the sphere multi-view path.
+
+\paragraph{New.}
+A scalar \fn{temporal\_guidance\_scale} is now accepted by \fn{basic\_sample\_shift\_shpere\_panorama} and,
+when nonzero, the model performs two forward passes per view:
+\begin{itemize}
+    \item \(\epsilon_t^\text{full}\): standard prediction with temporal attention enabled.
+    \item \(\epsilon_t^\text{image}\): prediction with \fn{no\_temporal\_attn=True}, analogous to a per-frame image model.
+\end{itemize}
+The temporally guided prediction is:
+\begin{equation}
+    \epsilon_t^\text{temp} = \epsilon_t^\text{full}
+    + \lambda_\text{temp} \bigl(\epsilon_t^\text{full} - \epsilon_t^\text{image}\bigr),
+\end{equation}
+where \(\lambda_\text{temp} = \texttt{temporal\_guidance\_scale}\).
+
+\paragraph{Purpose.}
+This is the temporal analogue of standard CFG:
+it emphasizes noise components that are consistent across frames (via the difference between full and image-only predictions).
+The effect is improved motion coherence and reduced ``frame-wise drifting'' across time while preserving prompt adherence.
+
+\subsection{Theta Offset: Float Division to Avoid Angular Gaps}
+
+\paragraph{Previous.}
+Theta offsets used integer division:
+\begin{equation}
+    \theta_\text{offset} = (i \bmod N)\cdot \bigl\lfloor\text{FoV}/N\bigr\rfloor,
+\end{equation}
+which can leave unvisited angular gaps when \(\text{FoV}\) is not divisible by \(N\).
+
+\paragraph{New.}
+The offset now uses floating-point division:
+\begin{equation}
+    \theta_\text{offset} = (i \bmod N)\cdot \frac{\text{FoV}}{N}.
+\end{equation}
+
+\paragraph{Purpose.}
+This ensures that the sequence of windows covers the intended FoV evenly without holes,
+improving dynamic degree and reducing un-sampled stripes in the equirectangular panorama.
+
+\subsection{Caching: VAE Encoding and Text Embeddings}
+
+\paragraph{Previous.}
+\begin{itemize}
+    \item With \fn{paste\_on\_static=True}, the same static panorama image was re-encoded by the VAE at \emph{every timestep}, even though it never changed.
+    \item Elevation-specific text prompts from \fn{phi\_prompt\_dict} were re-embedded via CLIP at every view and timestep.
+\end{itemize}
+
+\paragraph{New.}
+\begin{enumerate}
+    \item The VAE encoding of the static panorama is computed \emph{once} before the denoising loop and reused:
+    \[
+        \text{frame\_0\_latent} \leftarrow \text{cached encode}.
+    \]
+    \item A dictionary \(\phi\mapsto \text{text\_embedding}\) is precomputed before the loop, and the cached embeddings are reused for all timesteps and theta positions at that elevation.
+\end{enumerate}
+
+\paragraph{Purpose.}
+Both changes dramatically reduce redundant compute:
+\begin{itemize}
+    \item The tiled VAE encode of a large panorama is expensive; eliminating \(\mathcal{O}(T)\) identical encodes saves seconds to minutes per sample.
+    \item CLIP text encoders are also heavy; caching per elevation slashes the number of embeddings by roughly \(\mathcal{O}(T \cdot N_\theta(\phi))\).
+\end{itemize}
+This is particularly important in low-memory and low-throughput environments.
+
+\subsection{Robust Shift-Window Parameterization in Low-Resolution Settings}
+
+\paragraph{Previous.}
+The shift-window code computed overlap ratios and step sizes analytically and enforced:
+\[
+    0 \leq \text{overlap\_ratio} < 1, \qquad \text{latent\_offset\_step\_size} \geq 1
+\]
+with hard assertions.
+On very small resolutions (as used in low-memory mode), rounding could yield ratios slightly outside valid ranges or step sizes below 1, triggering assertion failures.
+
+\paragraph{New.}
+The code now:
+\begin{itemize}
+    \item Clamps overlap ratios into \([0, 0.9999]\) instead of asserting.
+    \item Ensures the latent offset step size is at least 1 when there is more than one window.
+\end{itemize}
+
+\paragraph{Purpose.}
+This makes the sampler robust to aggressive downscaling and low-memory presets.
+Instead of crashing, the pipeline will adaptively clamp to the nearest valid configuration, preserving the overall shift-window pattern.
+
+\subsection{Adaptive Tiled VAE Encoding with Cosine-Tapered Blending}
+
+\paragraph{Previous.}
+The tiled VAE encoder:
+\begin{itemize}
+    \item Used a fixed \(4\times 4\) tile grid with fixed overlaps.
+    \item Uniformly averaged overlapping latent values (equally weighted tiles),
+    making seams visible when the encoder's receptive field extended beyond the overlap.
+\end{itemize}
+
+\paragraph{New.}
+The encoder:
+\begin{enumerate}
+    \item Chooses tile counts \((h_\text{tiles}, w_\text{tiles})\) based on resolution (aiming for \(\approx64\) latent pixels per tile) and derives overlaps adaptively.
+    \item Applies a separable cosine-tapered weight in the overlap regions:
+    \begin{equation}
+        W(x,y) = w_h(x)\,w_w(y),
+    \end{equation}
+    where \(w_h\) and \(w_w\) decay smoothly from \(1\) inside tiles toward the overlap borders using:
+    \[
+        w(d) = \tfrac{1}{2}\bigl(1+\cos(\pi d / O)\bigr), \quad d\in[0,O],
+    \]
+    with \(O\) the overlap in latent pixels.
+    \item The global latent is then:
+    \[
+        L_{\text{fused}}(x,y) =
+        \frac{\sum_k W_k(x,y)L_k(x,y)}{\sum_k W_k(x,y)}.
+    \]
+\end{enumerate}
+
+\paragraph{Purpose.}
+This accomplishes two goals:
+\begin{itemize}
+    \item \textbf{Memory scaling}: more, smaller tiles reduce per-encode memory and allow high-resolution images to be encoded on 16\,GB GPUs.
+    \item \textbf{Visual quality}: cosine weighting suppresses hard seams between tiles by softly fading their contributions, which is especially important for smooth skies and large surfaces typical in panoramic content.
+\end{itemize}
+
+%==============================================================================
+\section{Scheduler Re-noising: \file{pipeline/scheduler.py}}
+%==============================================================================
+
+\subsection{From Direct Noise Injection to DDIM-Aware Re-noising}
+
+\paragraph{Previous formulation.}
+The method \fn{re\_noise(x\_a, step\_a, step\_b)} implemented:
+\begin{equation}
+    x_b = \sqrt{\frac{\bar{\alpha}_b}{\bar{\alpha}_a}}\,x_a
+          + \sqrt{1 - \frac{\bar{\alpha}_b}{\bar{\alpha}_a}}\,\tilde{\epsilon},
+\end{equation}
+with fresh Gaussian noise \(\tilde{\epsilon}\sim\mathcal{N}(0,I)\).
+This ``direct'' re-noising does not preserve the internal DDIM noise trajectory.
+
+\paragraph{New formulation.}
+The method now optionally accepts \fn{noise\_pred\_a} and, if provided, performs DDIM-inversion-style re-noising:
+\begin{align}
+    \hat{x}_0 &= \frac{x_a - \sqrt{1-\bar{\alpha}_a}\,\hat{\epsilon}_a}{\sqrt{\bar{\alpha}_a}},\\
+    x_b &= \sqrt{\bar{\alpha}_b}\,\hat{x}_0
+           + \sqrt{1-\bar{\alpha}_b-\sigma_b^2}\,\hat{\epsilon}_a
+           + \sigma_b\,\epsilon,
+\end{align}
+where \(\hat{\epsilon}_a=\texttt{noise\_pred\_a}\), \(\epsilon\sim\mathcal{N}(0,I)\), and \(\sigma_b\) is drawn from the DDIM sigma schedule.
+If \fn{noise\_pred\_a} is not provided, the method falls back to the original direct formulation.
+
+\paragraph{Purpose.}
+The DDIM-aware path preserves structural information when changing noise levels between scales (e.g.\ between base and upscale stages).
+Instead of injecting independent noise, the method reuses the estimated noise prediction, leading to more coherent refinements and better preservation of sharp details across stages.
+
+%==============================================================================
+\section{Latent Resizing and Spatial Smoothing: \file{diffusion\_utils.py}}
+%==============================================================================
+
+\subsection{Gaussian-Smoothed Latent Upsampling}
+
+\paragraph{Previous.}
+Latent resizing used \fn{F.interpolate} without any anti-aliasing or smoothing,
+and there was no way to lightly blur upsampled latents before re-noising.
+
+\paragraph{New.}
+The signature of \fn{resize\_video\_latent} now includes \fn{gaussian\_sigma}, and when this parameter is positive,
+the upsampled latent is processed by a spatial Gaussian filter:
+\begin{equation}
+    L_\text{smooth} = G_\sigma * L_\text{upsampled},
+\end{equation}
+where \(G_\sigma\) is a 2D Gaussian kernel applied per frame (via a grouped 2D convolution over the 5D tensor).
+
+\paragraph{Purpose.}
+This optional smoothing suppresses high-frequency artifacts introduced by interpolation,
+especially before a re-noising step in the upscale path.
+It yields crisper yet less noisy final outputs by slightly regularizing the latent manifold.
+
+%==============================================================================
+\section{Temporal Flicker and Video Saving: \file{loop\_merge\_utils.py}}
+%==============================================================================
+
+\subsection{Temporal Gaussian Smoothing}
+
+\paragraph{Previous.}
+Decoded video latents were converted to images frame-by-frame with no temporal filtering:
+any per-frame noise or slight variation directly appeared as flicker.
+
+\paragraph{New.}
+\file{loop\_merge\_utils.py} introduces:
+\begin{itemize}
+    \item A 1D Gaussian smoothing function along the time dimension:
+    \[
+        x^\prime_t = \sum_{\tau} k(t-\tau)\,x_\tau,
+    \]
+    where \(k\) is a normalized Gaussian kernel in time.
+    \item An extended \fn{save\_decoded\_video\_latents} that:
+    \begin{enumerate}
+        \item Optionally applies this temporal smoothing to the decoded frame tensors (controlled by \fn{temporal\_smooth\_sigma}).
+        \item Decodes and processes frames in configurable mini-batches for improved GPU utilization.
+    \end{enumerate}
+\end{itemize}
+
+\paragraph{Purpose.}
+A small temporal Gaussian (\(\sigma\approx 0.5\)–\(1.0\)) reduces inter-frame flickering and stabilizes subtle textures (e.g.\ grass, water, clouds) without significantly smearing motion.
+Batch processing is an efficiency improvement that does not change output semantics.
+
+%==============================================================================
+\section{Panorama Geometry and Blending: \file{panorama\_tensor\_utils.py} and \file{ring\_panorama\_tensor\_utils.py}}
+%==============================================================================
+
+\subsection{Equirectangular Longitude Normalization}
+
+\paragraph{Previous.}
+Longitude-to-pixel mapping used:
+\begin{equation}
+    u = \frac{\text{lon}}{2\pi}(W-1),
+\end{equation}
+so the rightmost pixel column mapped to \(\text{lon}=2\pi\), which is geometrically identical to \(\text{lon}=0\), duplicating one column.
+
+\paragraph{New.}
+Now:
+\begin{equation}
+    u = \frac{\text{lon}}{2\pi}W,
+\end{equation}
+with wrap-around handled by modular arithmetic downstream.
+
+\paragraph{Purpose.}
+This spreads \(W\) pixels uniformly over \([0,2\pi)\) without duplication, improving use of horizontal resolution and reducing seam artifacts at the 360° wrap.
+
+\subsection{Centered Pixel Grid for Gnomonic Projection}
+
+\paragraph{Previous.}
+The image grid for view extraction used:
+\[
+    x = -\frac{W}{2},\dots,\frac{W}{2}-1,\qquad
+    y = -\frac{H}{2},\dots,\frac{H}{2}-1,
+\]
+introducing a half-pixel bias when \(W\) or \(H\) are even.
+
+\paragraph{New.}
+The grid is now symmetric about the optical center:
+\begin{equation}
+    x_i = \frac{2i-(W-1)}{2},\quad
+    y_j = \frac{2j-(H-1)}{2},
+\end{equation}
+implemented via:
+\begin{lstlisting}
+x = torch.linspace(-(width-1)/2, (width-1)/2, steps=width)
+y = torch.linspace(-(height-1)/2, (height-1)/2, steps=height)
+\end{lstlisting}
+
+\paragraph{Purpose.}
+This removes the systematic 0.5\,px offset in both axes, improving geometric consistency between extracted perspective views and the equirectangular panorama across all latitudes.
+
+\subsection{Nearest-Neighbor Sampling: Floor vs Round}
+
+\paragraph{Previous.}
+Nearest-neighbor sampling computed indices using \(\lfloor u\rfloor, \lfloor v\rfloor\),
+which is effectively a ``round down'' scheme and biases sampling toward the negative direction.
+
+\paragraph{New.}
+Indices now use standard nearest rounding:
+\begin{equation}
+    u_0 = \operatorname{round}(u),\qquad v_0 = \operatorname{round}(v).
+\end{equation}
+
+\paragraph{Purpose.}
+This reduces average reprojection error (from \(\approx 0.5\) to \(\approx 0.25\) pixels under uniform sub-pixel offsets),
+resulting in slightly sharper and more symmetric view reconstructions, especially important for small details at high zoom.
+
+\subsection{Bilinear Splatting: Vectorization and Blending}
+
+\paragraph{Previous.}
+Bilinear write-back from a view to the panorama:
+\begin{itemize}
+    \item Used Python loops over batch and channel, with repeated \fn{index\_add\_} calls.
+    \item Overwrote the panorama content wherever the weight sum was non-zero:
+    \[
+        P(u,v) \leftarrow \frac{\sum_k w_k V_k}{\sum_k w_k},
+    \]
+    ignoring any existing contributions.
+\end{itemize}
+
+\paragraph{New.}
+The implementation:
+\begin{enumerate}
+    \item Vectorizes accumulation using \fn{scatter\_add\_} over the flattened panorama for all batches and channels.
+    \item Introduces a blend factor \(\alpha\in[0,1]\) so that:
+    \[
+        P_\text{new} =
+        \alpha \cdot \frac{\sum_k w_k V_k}{\sum_k w_k}
+        + (1-\alpha) \cdot P_\text{old}
+    \]
+    at covered pixels.
+\end{enumerate}
+
+\paragraph{Purpose.}
+This improves both speed and quality:
+\begin{itemize}
+    \item \textbf{Speed}: vectorization removes nested Python loops, reducing overhead for large view batches.
+    \item \textbf{Quality}: blending with the existing panorama allows a smoother fusion of overlapping views and multi-pass contributions, especially when using \(\alpha<1\) for soft updates.
+\end{itemize}
+
+%==============================================================================
+\section{Preprocessing and Image Loading: \file{precast\_latent\_utils.py} and \file{tensor\_utils.py}}
+%==============================================================================
+
+\subsection{Unified Resizing and Normalization}
+
+\paragraph{Previous.}
+Two pipelines coexisted:
+\begin{enumerate}
+    \item \file{precast\_latent\_utils.py} used \fn{transforms.Resize} (default interpolation) plus a no-op \fn{Normalize(mean=0, std=1)} followed by \((x*2-1)\).
+    \item \file{tensor\_utils.py} used \fn{cv2.resize(..., INTER\_LINEAR)} and then normalized with \((x/255-0.5)*2\).
+\end{enumerate}
+The mismatch in interpolation and redundant normalization caused small but systematic differences in pixel statistics.
+
+\paragraph{New.}
+The two code paths are now aligned:
+\begin{itemize}
+    \item \file{precast\_latent\_utils.py} uses:
+    \[
+        \text{Resize(image\_size, antialias=True)},\quad
+        \text{ToTensor},\quad
+        (x/255 - 0.5)\cdot 2.
+    \]
+    \item \file{tensor\_utils.py} chooses interpolation based on scale factor:
+    \begin{itemize}[nosep]
+        \item \fn{INTER\_AREA} for downscaling.
+        \item \fn{INTER\_LANCZOS4} for upscaling.
+    \end{itemize}
+    and also normalizes using \((x/255.0 - 0.5)\cdot 2.0\).
+\end{itemize}
+
+\paragraph{Purpose.}
+This unifies the preprocessing semantics:
+all conditioning images are now consistently mapped to \([-1,1]\) with high-quality interpolation.
+That stability feeds into the VAE and diffusion model, reducing unexpected differences between input paths.
+
+%==============================================================================
+\section{Quality Metrics Stub: \file{quality\_metrics.py}}
+%==============================================================================
+
+\subsection{Q-Align and CLIP Score Hooks}
+
+\paragraph{Previous.}
+The codebase did not have explicit entry points for computing Q-Align (image/video) or CLIP-based quality metrics.
+
+\paragraph{New.}
+The new module \file{quality\_metrics.py} defines placeholder functions:
+\begin{itemize}
+    \item \fn{compute\_qalign\_image\_score}: for per-frame image quality scoring.
+    \item \fn{compute\_qalign\_video\_score}: for video-level quality.
+    \item \fn{compute\_clip\_score}: for prompt-frame alignment via CLIP cosine similarity.
+\end{itemize}
+These functions accept external models or APIs but currently return \fn{None} by default.
+
+\paragraph{Purpose.}
+This is a structural change preparing the pipeline for integration of learned quality metrics:
+Q-Align and CLIP scores can be used for evaluation, ablations (e.g.\ comparing overlap schedules), or best-of-$k$ selection without modifying the core sampler logic.
+
+%==============================================================================
+\section{Summary and Expected Impact}
+%==============================================================================
+
+Table~\ref{tab:summary} summarizes the implemented changes by category and expected effect.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{0.26\textwidth}p{0.17\textwidth}p{0.12\textwidth}p{0.35\textwidth}@{}}
+\toprule
+\textbf{Change} & \textbf{File(s)} & \textbf{Primary Axis} & \textbf{Expected Effect} \\
+\midrule
+Temporal guidance scale in sphere pipeline & \file{gen\_pano\_360.py}, \file{i2v\_sphere\_panorama\_pipeline.py} & Motion / consistency & Stronger temporal coherence and smoother motion. \\
+Low-memory flag, reduced resolution and steps & \file{gen\_pano\_360.py} & Memory / throughput & Enables stable runs on 16\,GB GPUs with modest quality loss. \\
+Latitude-adaptive theta sampling & \file{gen\_pano\_360.py} & Geometry / scene richness & Uniform angular coverage, fewer redundant polar views. \\
+Cosine overlap and merge schedules & \file{gen\_pano\_360.py} & Temporal flicker & Fewer seam artifacts and sharper final details. \\
+DDIM-aware re-noising & \file{scheduler.py} & Graphics / structure & Better structural preservation across noise-level changes. \\
+Gaussian-smoothed latent upsampling & \file{diffusion\_utils.py} & Graphics & Less aliasing in upscaled latents. \\
+Temporal Gaussian smoothing and batched save & \file{loop\_merge\_utils.py} & Temporal flicker / efficiency & Reduced flicker and faster decode/save. \\
+Centered pixel grid and longitude normalization & \file{panorama\_tensor\_utils.py}, \file{ring\_panorama\_tensor\_utils.py} & Geometry & More accurate projections and better use of horizontal resolution. \\
+Nearest-neighbor via rounding & Same as above & Geometry & Reduced reprojection bias. \\
+Vectorized bilinear splatting with blend & Same as above & Geometry / code & Faster and more flexible multi-view fusion. \\
+Adaptive tiled VAE encode with cosine weights & \file{i2v\_sphere\_panorama\_pipeline.py} & Image quality / memory & Smoother tile boundaries and scalable encoding to high resolutions. \\
+Unified resize and normalization & \file{precast\_latent\_utils.py}, \file{tensor\_utils.py} & Image quality & Consistent conditioning and reduced artifacts. \\
+Shift-window robustness in low-res mode & \file{i2v\_sphere\_panorama\_pipeline.py} & Stability & Prevents assertion failures in aggressive low-memory settings. \\
+Q-Align / CLIP metric stubs & \file{quality\_metrics.py} & Evaluation & Infrastructure for future quality-aware selection and scoring. \\
+\bottomrule
+\end{tabular}
+\caption{Summary of implemented changes and their intended impact.}
+\label{tab:summary}
+\end{table}
+
+\section*{Conclusion}
+
+The forked DynamicScaler codebase now implements a range of mathematically motivated and engineering-driven improvements:
+geometric corrections, temporal guidance, smooth scheduling, adaptive tiling, and low-memory presets.
+Together, these changes make the pipeline more robust on constrained GPUs, reduce visual artifacts (seams, flicker, aliasing), and provide hooks for future integration of learned quality metrics such as Q-Align and CLIP-based scores.
+
+\end{document}
+
