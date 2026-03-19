@@ -412,16 +412,32 @@ def run_static_wrap_panorama(vargs: "VArgs") -> str:
         xx = (np.linspace(0, w - 1, new_w)).astype(np.int64)
         img_rs = img[yy][:, xx]
 
-    # Tile horizontally to fill width
-    reps = int(math.ceil(W_out / img_rs.shape[1])) + 2
-    tiled = np.concatenate([img_rs] * reps, axis=1)
-    start_x = (tiled.shape[1] - W_out) // 2
-    pano = tiled[:, start_x : start_x + W_out].copy()
+    # Make the source tile horizontally seamless so repeating doesn't create internal seams/gaps.
+    overlap = max(0, int(vargs.wrap_overlap_px))
+    tile = img_rs.copy()
+    if overlap >= 4:
+        overlap = min(overlap, tile.shape[1] // 3)
+        left = tile[:, :overlap].astype(np.float32)
+        right = tile[:, -overlap:].astype(np.float32)
+        if vargs.wrap_mirror_edges:
+            left_src = left[:, ::-1]
+            right_src = right[:, ::-1]
+        else:
+            left_src = left
+            right_src = right
+        alpha = np.linspace(0.0, 1.0, overlap, dtype=np.float32)[None, :, None]
+        tile[:, :overlap] = (left_src * (1 - alpha) + right_src * alpha).astype(np.uint8)
+        tile[:, -overlap:] = (right_src * (1 - alpha[:, ::-1]) + left_src * alpha[:, ::-1]).astype(np.uint8)
 
-    # Blend seam between left and right edges
+    # Wrap-index horizontally to fill panorama width (repeat the seamless tile).
+    tile_w = tile.shape[1]
+    idx = (np.arange(W_out) % max(1, tile_w)).astype(np.int64)
+    pano = tile[:, idx, :].copy()
+
+    # Blend seam between panorama left/right edges for extra cyclic consistency.
     overlap = max(0, int(vargs.wrap_overlap_px))
     overlap = min(overlap, W_out // 4)
-    if overlap >= 4:
+    if overlap >= 4 and W_out >= overlap * 2:
         left = pano[:, :overlap].astype(np.float32)
         right = pano[:, -overlap:].astype(np.float32)
 
