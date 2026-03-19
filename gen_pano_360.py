@@ -1034,6 +1034,63 @@ if __name__ == "__main__":
     vargs = VArgs.from_args()
     print(vargs)
 
+    # Image-specific default prompts/phi prompts based on input filename.
+    # This lets users switch images via --pano_image_path without editing code.
+    try:
+        img_name = os.path.basename(vargs.pano_image_path)
+    except Exception:
+        img_name = ""
+
+    if img_name == "geometric_pattern_1.jpg":
+        vargs.prompt = (
+            "Clean high-contrast triangular tessellation pattern, sharp thin lines, crisp dots at intersections, "
+            "uniform spacing, seamless repeating texture, flat white background, minimal noise"
+        )
+        # phi prompts: mostly symmetric, but keep wording tied to upper/middle/lower bands
+        vargs.phi_prompt_dict = {
+            90: "Clean triangular tessellation on bright white, very thin grey lines, evenly spaced dots",
+            75: "Clean triangular grid pattern, thin lines and dots, high contrast, minimal distortion",
+            60: "Dense triangular lattice, crisp intersections, uniform spacing",
+            45: "Seamless triangular tessellation pattern, clean geometry, minimal noise",
+            0: "Seamless triangular tessellation pattern, sharp lines and dots, high contrast",
+            -45: "Triangular grid pattern, crisp lines, evenly spaced nodes, flat lighting",
+            -60: "Triangular lattice with clean edges and uniform spacing",
+            -75: "Clean triangular pattern on bright background, thin grey lines and dots",
+            -90: "Clean triangular pattern on bright background, thin grey lines and dots",
+        }
+    elif img_name == "geometric_pattern_2.jpg":
+        vargs.prompt = (
+            "Clean high-contrast square grid pattern, thin straight lines forming regular squares, "
+            "small dots at each grid intersection, uniform spacing, bright white background, minimal noise"
+        )
+        vargs.phi_prompt_dict = {
+            90: "Clean square grid against bright white, very thin horizontal and vertical lines, tiny dots at intersections",
+            75: "Regular square grid, evenly spaced lines and dots, high contrast, minimal distortion",
+            60: "Dense square lattice pattern, crisp right angles, uniform spacing",
+            45: "Seamless square grid texture, clean straight lines and intersection dots",
+            0: "Seamless square grid pattern, sharp vertical and horizontal lines, evenly spaced points",
+            -45: "Square grid pattern, crisp straight lines, uniform spacing, flat lighting",
+            -60: "Square lattice with clean 90 degree corners and evenly spaced dots",
+            -75: "Clean square grid on white background, thin grey lines and dots",
+            -90: "Clean square grid on white background, thin grey lines and dots",
+        }
+    elif img_name == "geometric_pattern_3.jpg":
+        vargs.prompt = (
+            "Clean geometric pattern of large diamonds built from triangles, bold diagonal lines over faint triangular lattice, "
+            "high contrast on bright white background, sharp intersections, seamless repeating texture"
+        )
+        vargs.phi_prompt_dict = {
+            90: "Large diamond shapes outlined by bold diagonal lines over faint triangular lattice on bright white",
+            75: "Diamond-over-triangles pattern, strong diagonals, subtle internal triangle grid, uniform spacing",
+            60: "Geometric diamonds made from triangles, bold outer edges, inner faint triangular structure",
+            45: "Seamless diamond and triangle tessellation, crisp bold diagonals, clean intersections",
+            0: "Seamless diamond-over-triangle pattern, strong diagonal lines crossing over fine triangular lattice",
+            -45: "Diamond and triangle grid, bold diagonal strokes with fine internal triangles, flat lighting",
+            -60: "Large diamonds composed of small triangles, clean high-contrast structure",
+            -75: "Clean diamond-and-triangle pattern on white background, bold diagonals and faint interior lines",
+            -90: "Clean diamond-and-triangle pattern on white background, bold diagonals and faint interior lines",
+        }
+
     if getattr(vargs, "launch_ui", False):
         demo = launch_upload_ui(default_out_dir=vargs.static_out_dir)
         demo.launch(server_name=vargs.ui_host, server_port=int(vargs.ui_port), share=bool(vargs.ui_share))
