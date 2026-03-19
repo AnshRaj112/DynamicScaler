@@ -35,6 +35,8 @@ class VArgs:
     # Used when mode="static_wrap": make a simple wrap-around panorama from any image (no diffusion).
     wrap_overlap_px: int = 64  # seam blending overlap in pixels (in output image space)
     wrap_mirror_edges: bool = True  # mirror edges before blending to hide harsh seams
+    auto_phi_prompts: bool = True  # auto-generate phi_prompt_dict from input image + base prompt
+    auto_phi_prompt_mode: Literal["uniform", "heuristic_bands"] = "heuristic_bands"
 
     # Default prompt & phi_prompt_dict used by the dynamic pipeline; safe via default_factory.
     prompt: str = (
@@ -211,6 +213,97 @@ def _write_static_viewer_html(output_dir: str, image_filename: str, title: str =
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     return out_path
+
+
+def _simple_scene_tokens_from_band(mean_rgb):
+    """
+    Extremely lightweight heuristic to turn a mean RGB into coarse descriptors.
+    This is intentionally simple (works offline, no extra deps).
+    """
+    r, g, b = [float(x) for x in mean_rgb]
+    tokens = []
+    # brightness
+    v = (r + g + b) / 3.0
+    if v > 200:
+        tokens.append("bright")
+    elif v < 60:
+        tokens.append("dark")
+    else:
+        tokens.append("well-lit")
+    # dominant hue-ish
+    if b > r + 20 and b > g + 20:
+        tokens.append("blue")
+        if v > 140:
+            tokens.append("sky-like")
+    elif g > r + 20 and g > b + 20:
+        tokens.append("green")
+        tokens.append("foliage-like")
+    elif r > g + 20 and r > b + 20:
+        tokens.append("warm")
+    # saturation-ish
+    spread = max(r, g, b) - min(r, g, b)
+    if spread < 18:
+        tokens.append("low-saturation")
+    else:
+        tokens.append("high-contrast")
+    return tokens
+
+
+def build_phi_prompt_dict(
+    image_path: str,
+    base_prompt: str,
+    mode: Literal["uniform", "heuristic_bands"] = "heuristic_bands",
+) -> Dict[int, str]:
+    """
+    Build phi-specific prompts at runtime so users don't edit code.
+
+    - uniform: use the same base prompt for all phi
+    - heuristic_bands: analyze top/middle/bottom horizontal bands and produce
+      slightly different prompts for sky/equator/ground latitudes.
+    """
+    if mode == "uniform":
+        return {90: base_prompt, 75: base_prompt, 60: base_prompt, 45: base_prompt, 0: base_prompt,
+                -45: base_prompt, -60: base_prompt, -75: base_prompt, -90: base_prompt}
+
+    import numpy as np
+    import imageio.v3 as iio
+
+    img = iio.imread(image_path)
+    if img.ndim == 2:
+        img = np.stack([img, img, img], axis=-1)
+    if img.shape[-1] == 4:
+        img = img[..., :3]
+    img = img.astype(np.float32)
+    h = img.shape[0]
+    # bands: top 25%, middle 50%, bottom 25%
+    top = img[: max(1, h // 4)]
+    mid = img[max(1, h // 4): max(2, (3 * h) // 4)]
+    bot = img[max(2, (3 * h) // 4):]
+
+    top_tokens = _simple_scene_tokens_from_band(top.reshape(-1, 3).mean(axis=0))
+    mid_tokens = _simple_scene_tokens_from_band(mid.reshape(-1, 3).mean(axis=0))
+    bot_tokens = _simple_scene_tokens_from_band(bot.reshape(-1, 3).mean(axis=0))
+
+    def enrich(prompt, tokens):
+        # Keep user prompt primary; add a few coarse stabilizers.
+        extra = ", ".join(tokens[:4])
+        return f"{prompt}, {extra}" if extra else prompt
+
+    top_prompt = enrich(base_prompt, ["upper hemisphere"] + top_tokens)
+    mid_prompt = enrich(base_prompt, ["horizon band"] + mid_tokens)
+    bot_prompt = enrich(base_prompt, ["lower hemisphere"] + bot_tokens)
+
+    return {
+        90: top_prompt,
+        75: top_prompt,
+        60: top_prompt,
+        45: mid_prompt,
+        0: mid_prompt,
+        -45: bot_prompt,
+        -60: bot_prompt,
+        -75: bot_prompt,
+        -90: bot_prompt,
+    }
 
 
 def run_static_panorama(vargs: "VArgs") -> str:
@@ -856,4 +949,13 @@ if __name__ == "__main__":
     # dynamic / legacy behavior
     os.environ["CUDA_VISIBLE_DEVICES"] = f"{vargs.gpu_id}"
     os.environ["WORLD_SIZE"] = "1"
+
+    # Auto-generate phi_prompt_dict at runtime (no code edits needed per image)
+    if getattr(vargs, "auto_phi_prompts", False):
+        vargs.phi_prompt_dict = build_phi_prompt_dict(
+            image_path=vargs.pano_image_path,
+            base_prompt=vargs.prompt,
+            mode=getattr(vargs, "auto_phi_prompt_mode", "heuristic_bands"),
+        )
+
     run_dynamic_video_generation(vargs)
