@@ -37,6 +37,10 @@ class VArgs:
     wrap_mirror_edges: bool = True  # mirror edges before blending to hide harsh seams
     auto_phi_prompts: bool = True  # auto-generate phi_prompt_dict from input image + base prompt
     auto_phi_prompt_mode: Literal["uniform", "heuristic_bands"] = "heuristic_bands"
+    launch_ui: bool = False  # launch a simple upload UI (Gradio) instead of CLI run
+    ui_share: bool = False  # Gradio share link (useful on Kaggle)
+    ui_host: str = "127.0.0.1"
+    ui_port: int = 7860
 
     # Default prompt & phi_prompt_dict used by the dynamic pipeline; safe via default_factory.
     prompt: str = (
@@ -440,6 +444,87 @@ def run_static_wrap_panorama(vargs: "VArgs") -> str:
 
     print(f"[static_wrap] wrote panorama image: {out_img}")
     return out_img
+
+
+def launch_upload_ui(default_out_dir: str = "./results/static_pano"):
+    """
+    Minimal runtime UI for uploading an image and generating a static panorama.
+    Designed to work on low-memory GPUs/CPU by defaulting to mode="static_wrap".
+    """
+    try:
+        import gradio as gr
+    except Exception as e:
+        raise RuntimeError(
+            "Gradio is required for --launch_ui. Install it with `pip install gradio`."
+        ) from e
+
+    import tempfile
+    import imageio.v3 as iio
+
+    def _run(image, mode, prompt, out_dir, height, overlap_px, mirror_edges, write_viewer):
+        if image is None:
+            raise gr.Error("Please upload an image.")
+
+        os.makedirs(out_dir, exist_ok=True)
+        # Save uploaded image to a temp file inside out_dir so viewer.html can reference it if needed.
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tmp_path = os.path.join(out_dir, f"uploaded_{ts}.png")
+        # gradio gives numpy array (H,W,3) uint8 typically
+        iio.imwrite(tmp_path, image)
+
+        # Build args for the run
+        va = VArgs()
+        va.mode = mode
+        va.pano_image_path = tmp_path
+        va.static_out_dir = out_dir
+        va.static_height = int(height)
+        va.static_width = int(2 * int(height))
+        va.wrap_overlap_px = int(overlap_px)
+        va.wrap_mirror_edges = bool(mirror_edges)
+        va.write_viewer_html = bool(write_viewer)
+        if prompt:
+            va.prompt = prompt
+
+        if va.mode == "static":
+            out_img = run_static_panorama(va)
+        elif va.mode == "static_wrap":
+            out_img = run_static_wrap_panorama(va)
+        else:
+            raise gr.Error("UI currently supports only static/static_wrap (no model).")
+
+        viewer_path = os.path.join(out_dir, "viewer.html")
+        viewer_note = viewer_path if (va.write_viewer_html and os.path.exists(viewer_path)) else ""
+        return out_img, viewer_note
+
+    with gr.Blocks(title="DynamicScaler — Static Panorama") as demo:
+        gr.Markdown("## Static panorama generator\nUpload an image and generate an equirectangular (2:1) panorama.\n\nRecommended on Kaggle/P100: **static_wrap** (fast, deterministic).")
+        with gr.Row():
+            inp = gr.Image(label="Upload image", type="numpy")
+            out = gr.Image(label="Output panorama", type="filepath")
+
+        with gr.Row():
+            mode = gr.Dropdown(choices=["static_wrap", "static"], value="static_wrap", label="Mode")
+            height = gr.Slider(256, 2048, value=1024, step=64, label="Panorama height (width = 2×height)")
+
+        with gr.Row():
+            overlap_px = gr.Slider(0, 512, value=128, step=8, label="Seam blend overlap (px)")
+            mirror_edges = gr.Checkbox(value=True, label="Mirror edges before blending")
+
+        with gr.Row():
+            out_dir = gr.Textbox(value=default_out_dir, label="Output folder")
+            write_viewer = gr.Checkbox(value=True, label="Write viewer.html (Pannellum)")
+
+        prompt = gr.Textbox(value="", label="Optional prompt (stored, not used by static_wrap)")
+        btn = gr.Button("Generate panorama")
+        viewer = gr.Textbox(value="", label="viewer.html path (open in browser)", interactive=False)
+
+        btn.click(
+            _run,
+            inputs=[inp, mode, prompt, out_dir, height, overlap_px, mirror_edges, write_viewer],
+            outputs=[out, viewer],
+        )
+
+    return demo
 
 @dataclass
 class RunArgs:
@@ -938,6 +1023,11 @@ def run_dynamic_video_generation(vargs: "VArgs"):
 if __name__ == "__main__":
     vargs = VArgs.from_args()
     print(vargs)
+
+    if getattr(vargs, "launch_ui", False):
+        demo = launch_upload_ui(default_out_dir=vargs.static_out_dir)
+        demo.launch(server_name=vargs.ui_host, server_port=int(vargs.ui_port), share=bool(vargs.ui_share))
+        raise SystemExit(0)
 
     if vargs.mode == "static":
         run_static_panorama(vargs)
