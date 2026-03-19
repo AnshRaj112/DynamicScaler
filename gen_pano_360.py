@@ -454,8 +454,18 @@ def launch_upload_ui(default_out_dir: str = "./results/static_pano"):
     try:
         import gradio as gr
     except Exception as e:
+        msg = str(e)
+        if "ImageClassificationOutputElement" in msg or "huggingface_hub" in msg:
+            raise RuntimeError(
+                "Gradio failed to import due to a version mismatch with `huggingface_hub`.\n"
+                "On Kaggle/Colab, fix it by upgrading both packages:\n\n"
+                "  pip install -U gradio huggingface_hub\n\n"
+                "Then re-run:\n"
+                "  python gen_pano_360.py --launch_ui --ui_share\n"
+            ) from e
         raise RuntimeError(
-            "Gradio is required for --launch_ui. Install it with `pip install gradio`."
+            "Gradio is required for --launch_ui. Install it with:\n\n"
+            "  pip install -U gradio\n"
         ) from e
 
     import tempfile
